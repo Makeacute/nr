@@ -39,7 +39,7 @@ TARGET SELECTION
 
 COMMON FLAGS
   --ui auto|rich|plain|raw|json
-                           Select command output mode.
+                           Select command output mode. Rich mode shows a live graph.
   --log-file PATH          Capture the full backend log at PATH.
   --dry                    Alias lifecycle commands to preview-style behavior.
   --ask                    Ask before activation.
@@ -52,6 +52,7 @@ WORKFLOWS
   Validate:                nr check --all -> nr build
   Preview:                 nr preview -> nr switch
   Update safely:           nr update -> nr preview -> nr switch -> nr publish
+  Manual:                  man nr
 "#
         .trim()
     );

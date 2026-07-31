@@ -1,0 +1,184 @@
+.TH NR 1 "July 2026" "nr 0.2.0" "User Commands"
+.SH NAME
+nr \- Git-aware NixOS lifecycle helper
+.SH SYNOPSIS
+.B nr
+[\fIOPTIONS\fR]
+\fICOMMAND\fR
+[\fIARGS\fR...]
+.SH DESCRIPTION
+.B nr
+builds, previews, activates, updates, checks, and publishes a NixOS flake.
+Lifecycle commands build through
+.BR nixos-rebuild (8),
+parse Nix internal JSON events directly, show a bounded rebuild graph, explain
+closure and activation impact, and preserve the backend exit code.
+.PP
+The full backend stream is captured in a log file. Terminal output is intended
+to answer what is changing, what is currently building or fetching, what
+activation would do, and how to recover.
+.SH COMMANDS
+.TP
+.B build
+Build the selected host without activating it. By default, leaves a
+.B result
+link in the current working directory.
+.TP
+.B switch
+Build, show the closure diff, dry-activate, then activate the new system.
+.TP
+.B test
+Build and activate until the next reboot. The boot default remains unchanged.
+.TP
+.B boot
+Build and register the new generation as the next boot default without
+activating it immediately.
+.TP
+.B preview
+Build into a temporary directory, show the closure diff, and dry-activate
+without mutating bootloader or profile state.
+.TP
+.B rollback
+Run the official previous-generation rollback:
+.BR "nixos-rebuild switch --rollback" .
+.TP
+.B generations
+Show NixOS generations.
+.TP
+.B update
+Update
+.B flake.lock
+or selected flake inputs. With
+.BR --switch ,
+perform Git preflight before updating, then build and activate.
+.TP
+.B publish
+Review changes, commit them, and optionally push.
+.TP
+.B check
+Run configured checks. The default is
+.BR "nix flake check" .
+.TP
+.B doctor
+Show target, config, dependency, and Git diagnostics.
+.TP
+.B cheat
+Print a compact terminal reference.
+.SH OPTIONS
+.TP
+.BI "--flake " PATH[#HOST]
+Select the flake path and optionally the host.
+.TP
+.BI "--host " HOST
+Override the NixOS configuration name.
+.TP
+.BI "--ui " auto|rich|plain|raw|json
+Select output mode. The default,
+.BR auto ,
+uses rich output only when stdout and stderr are interactive terminals.
+.TP
+.BI "--log-file " PATH
+Capture the full backend log at
+.IR PATH .
+Without this flag, logs are written under
+.B $XDG_STATE_HOME/nr/logs/
+or
+.BR ~/.local/state/nr/logs/ .
+.TP
+.B --dry
+Alias lifecycle commands to preview-style behavior.
+.TP
+.B --ask
+Ask before activation.
+.TP
+.B --offline
+Forward offline mode to Nix.
+.TP
+.B --show-trace
+Forward Nix traces.
+.TP
+.BI "--specialisation " NAME
+Build or activate a NixOS specialisation.
+.TP
+.B --verbose
+Print additional command context where supported.
+.TP
+.B --
+Pass remaining arguments directly to the backend command.
+.SH OUTPUT MODES
+.TP
+.B auto
+Use rich output on interactive terminals and plain output otherwise.
+.TP
+.B rich
+Show a styled, bounded live rebuild graph plus summaries.
+.TP
+.B plain
+Print stable script-friendly summaries and warnings or errors only.
+.TP
+.B raw
+Pass backend stdout and stderr through.
+.TP
+.B json
+Print the final structured report as JSON.
+.SH TARGET DISCOVERY
+For commands that need a NixOS flake,
+.B nr
+checks these sources in order:
+.IP "1." 4
+.B --flake
+.IP "2." 4
+.B NR_FLAKE
+.IP "3." 4
+A
+.B flake.nix
+in the current directory or a parent directory
+.IP "4." 4
+.B [target].flake
+in
+.B ~/.config/nr/config.toml
+.IP "5." 4
+.B /etc/nixos
+.PP
+The host comes from
+.BR --host ,
+the
+.B #HOST
+flake fragment,
+.BR NR_HOST ,
+repo config, user config, or the machine hostname.
+.SH FILES
+.TP
+.B ~/.config/nr/config.toml
+User configuration.
+.TP
+.B .nr.toml
+Repository configuration at the selected flake root.
+.TP
+.B ~/.local/state/nr/logs/
+Default log directory when
+.B XDG_STATE_HOME
+is unset.
+.SH EXAMPLES
+.TP
+.B nr preview --flake /etc/nixos#desktop
+Build, diff, and dry-activate the
+.B desktop
+host without mutating system state.
+.TP
+.B nr switch --ask
+Build, explain impact, ask for confirmation, then activate.
+.TP
+.B nr update nixpkgs --switch
+Update one input, then build and activate after Git preflight.
+.TP
+.B nr build --ui raw --show-trace
+Build with backend output passed through directly.
+.SH EXIT STATUS
+.B nr
+exits with zero on success. Backend failures preserve the backend exit code
+when it is available.
+.SH SEE ALSO
+.BR nixos-rebuild (8),
+.BR nix (1),
+.BR git (1)

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::config::FlakeTarget;
-use crate::events::{BuildState, NixEvent};
+use crate::events::{Activity, BuildState, NixEvent};
 use crate::git::GitSummary;
 use crate::impact::{ActivationImpact, ClosureDiff, GenerationInfo};
 use crate::process::{StreamLine, StreamSource};
@@ -66,6 +66,7 @@ pub struct RebuildReport {
 pub struct Renderer {
     mode: OutputMode,
     last_rich_render: Instant,
+    last_rich_lines: usize,
 }
 
 impl Renderer {
@@ -73,6 +74,7 @@ impl Renderer {
         Self {
             mode: mode.effective(),
             last_rich_render: Instant::now() - Duration::from_secs(1),
+            last_rich_lines: 0,
         }
     }
 
@@ -101,22 +103,17 @@ impl Renderer {
         match self.mode {
             OutputMode::Json | OutputMode::Raw => {}
             OutputMode::Plain => println!("phase: {phase}"),
-            OutputMode::Rich | OutputMode::Auto => println!("\x1b[1;34m{phase}\x1b[0m"),
+            OutputMode::Rich | OutputMode::Auto => {
+                self.clear_rich_block();
+                println!("\x1b[1;34m{phase}\x1b[0m");
+            }
         }
     }
 
     pub fn nix_event(&mut self, _event: &NixEvent, state: &BuildState) {
         match self.mode {
             OutputMode::Rich | OutputMode::Auto => self.render_rich_state(state),
-            OutputMode::Plain => {
-                if let Some(activity) = state.slowest_active() {
-                    println!(
-                        "building: {} [{}]",
-                        activity.text,
-                        activity.category.label()
-                    );
-                }
-            }
+            OutputMode::Plain => {}
             OutputMode::Raw | OutputMode::Json => {}
         }
     }
@@ -128,9 +125,10 @@ impl Renderer {
                 StreamSource::Stderr => eprintln!("{}", line.line),
             },
             OutputMode::Rich | OutputMode::Plain | OutputMode::Auto => {
-                let lower = line.line.to_lowercase();
-                if lower.contains("warning") || lower.contains("error") || lower.contains("failed")
-                {
+                if should_print_backend_line(&line.line) {
+                    if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
+                        self.clear_rich_block();
+                    }
                     eprintln!("{}", line.line);
                 }
             }
@@ -140,6 +138,9 @@ impl Renderer {
 
     pub fn parser_fallback(&mut self) {
         if self.mode != OutputMode::Json {
+            if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
+                self.clear_rich_block();
+            }
             eprintln!("Nix JSON output changed; falling back to plain log streaming.");
         }
     }
@@ -152,7 +153,12 @@ impl Renderer {
                     print!("{}", diff.raw);
                 }
             }
-            _ => print_diff_summary(diff),
+            _ => {
+                if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
+                    self.clear_rich_block();
+                }
+                print_diff_summary(diff);
+            }
         }
     }
 
@@ -164,7 +170,12 @@ impl Renderer {
                     print!("{}", activation.raw);
                 }
             }
-            _ => print_activation_summary(activation),
+            _ => {
+                if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
+                    self.clear_rich_block();
+                }
+                print_activation_summary(activation);
+            }
         }
     }
 
@@ -174,7 +185,7 @@ impl Renderer {
             OutputMode::Raw => {}
             OutputMode::Plain | OutputMode::Rich | OutputMode::Auto => {
                 if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
-                    print!("\r\x1b[2K");
+                    self.clear_rich_block();
                 }
                 println!("result: {}", report.result);
                 if let Some(path) = &report.store_path {
@@ -191,32 +202,203 @@ impl Renderer {
     }
 
     fn render_rich_state(&mut self, state: &BuildState) {
-        if self.last_rich_render.elapsed() < Duration::from_millis(250) {
+        if self.last_rich_render.elapsed() < Duration::from_millis(500) {
             return;
         }
         self.last_rich_render = Instant::now();
-        let active = state.running.len();
-        let phase = if state.phase.is_empty() {
-            "building"
-        } else {
-            &state.phase
-        };
-        let categories = state
-            .running_by_category()
-            .into_iter()
-            .map(|(category, count)| format!("{}:{count}", category.label()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let slowest = state
-            .slowest_active()
-            .map(|activity| activity.text.as_str())
-            .unwrap_or("waiting for Nix output");
-        print!(
-            "\r\x1b[2K\x1b[1;32m{phase}\x1b[0m active:{active} done:{} failed:{} downloads:{} {} | {}",
-            state.completed, state.failed, state.downloads, categories, slowest
-        );
+        let lines = build_graph_lines(state, terminal_width());
+        self.clear_rich_block();
+        for line in &lines {
+            println!("{line}");
+        }
+        self.last_rich_lines = lines.len();
         let _ = io::stdout().flush();
     }
+
+    fn clear_rich_block(&mut self) {
+        if self.last_rich_lines == 0 {
+            return;
+        }
+        for _ in 0..self.last_rich_lines {
+            print!("\x1b[1A\r\x1b[2K");
+        }
+        self.last_rich_lines = 0;
+        let _ = io::stdout().flush();
+    }
+}
+
+fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
+    let width = width.clamp(48, 180);
+    let phase = if state.phase.is_empty() {
+        "building"
+    } else {
+        &state.phase
+    };
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "build graph  phase:{phase} active:{} done:{} failed:{} downloads:{} source:{} cache:{}",
+        state.running.len(),
+        state.completed,
+        state.failed,
+        state.downloads,
+        state.source_builds,
+        state.binary_substitutes
+    ));
+
+    let categories = state
+        .running_by_category()
+        .into_iter()
+        .map(|(category, count)| format!("{}:{count}", category.label()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    lines.push(format!(
+        "categories: {}",
+        if categories.is_empty() {
+            "none".to_string()
+        } else {
+            categories
+        }
+    ));
+    lines.push("system closure".to_string());
+
+    let active = state.running.values().collect::<Vec<_>>();
+    let shown = active.len().min(6);
+    for (index, activity) in active.iter().take(shown).enumerate() {
+        let has_more = active.len() > shown;
+        let is_last = index + 1 == shown && !has_more;
+        let connector = if is_last { "`--" } else { "|--" };
+        lines.push(activity_line(connector, activity));
+        if index < 3
+            && let Some(why) = state.why_building(activity)
+        {
+            let prefix = if is_last { "    " } else { "|   " };
+            lines.push(format!("{prefix}why: {}", compact_activity_text(&why)));
+        }
+    }
+
+    if active.is_empty() {
+        lines.push("`-- waiting for Nix activity".to_string());
+    } else if active.len() > shown {
+        lines.push(format!("`-- ... {} more active", active.len() - shown));
+    }
+
+    if let Some(activity) = state.slowest_active() {
+        lines.push(format!(
+            "slowest: {} [{}]",
+            compact_activity_text(&activity.text),
+            activity.category.label()
+        ));
+    }
+    if !state.errors.is_empty() {
+        lines.push(format!("errors: {}", state.errors.len()));
+    }
+    if !state.warnings.is_empty() {
+        lines.push(format!("warnings: {}", state.warnings.len()));
+    }
+
+    lines
+        .into_iter()
+        .map(|line| truncate_line(&line, width))
+        .collect()
+}
+
+fn activity_line(connector: &str, activity: &Activity) -> String {
+    format!(
+        "{connector} {} {} [{}]",
+        activity_kind(activity),
+        compact_activity_text(&activity.text),
+        activity.category.label()
+    )
+}
+
+fn activity_kind(activity: &Activity) -> &'static str {
+    let lower = activity.text.to_lowercase();
+    if activity.substitute {
+        "fetch"
+    } else if lower.contains("evaluat") {
+        "eval"
+    } else if activity.source_build {
+        "build"
+    } else {
+        "wait"
+    }
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width >= 40)
+        .unwrap_or(100)
+}
+
+fn compact_activity_text(text: &str) -> String {
+    let trimmed = text.trim().trim_matches('\'').trim_matches('"');
+    if let Some(store_name) = store_name(trimmed) {
+        return store_name;
+    }
+    if let Some(config_index) = trimmed.find("nixosConfigurations.") {
+        let mut value = trimmed[config_index..]
+            .trim_matches('\'')
+            .trim_matches('"')
+            .replace("nixosConfigurations.", "");
+        value = value.replace(".config.system.build.", ".");
+        value = value.replace("\".", ".");
+        value = value.replace(".\"", ".");
+        return value;
+    }
+    trimmed.replace("git+file://", "")
+}
+
+fn store_name(text: &str) -> Option<String> {
+    let marker = "/nix/store/";
+    let index = text.find(marker)?;
+    let rest = &text[index + marker.len()..];
+    let end = rest
+        .find(|character: char| character.is_whitespace() || matches!(character, '\'' | '"'))
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim_end_matches(".drv");
+    Some(
+        name.split_once('-')
+            .map(|(_, package)| package)
+            .unwrap_or(name)
+            .to_string(),
+    )
+}
+
+fn truncate_line(line: &str, max_width: usize) -> String {
+    if line.chars().count() <= max_width {
+        return line.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    let keep = max_width - 3;
+    let head = keep / 2;
+    let tail = keep - head;
+    let prefix = line.chars().take(head).collect::<String>();
+    let suffix = line
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
+fn should_print_backend_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("debug:") || lower.starts_with("trace:") {
+        return false;
+    }
+    lower.starts_with("warning:")
+        || lower.starts_with("error:")
+        || lower.starts_with("fatal:")
+        || lower.contains("error:")
+        || lower.contains("failed")
 }
 
 fn print_header_details(header: &RebuildHeader) {
@@ -393,4 +575,70 @@ fn json_escape(value: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::events::{Activity, BuildCategory, BuildState};
+
+    use super::{build_graph_lines, should_print_backend_line, truncate_line};
+
+    #[test]
+    fn graph_lines_are_bounded() {
+        let mut state = BuildState {
+            phase: "building".to_string(),
+            completed: 9,
+            downloads: 2,
+            source_builds: 1,
+            binary_substitutes: 1,
+            ..BuildState::default()
+        };
+        state.running.insert(
+            1,
+            Activity {
+                id: 1,
+                parent: None,
+                text: "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-linux-with-a-very-long-name.drv'"
+                    .to_string(),
+                category: BuildCategory::KernelBoot,
+                source_build: true,
+                substitute: false,
+            },
+        );
+        state.running.insert(
+            2,
+            Activity {
+                id: 2,
+                parent: Some(1),
+                text: "evaluating derivation 'git+file:///etc/nixos#nixosConfigurations.\"nixos\".config.system.build.toplevel'"
+                    .to_string(),
+                category: BuildCategory::Unknown,
+                source_build: false,
+                substitute: false,
+            },
+        );
+
+        let lines = build_graph_lines(&state, 64);
+
+        assert!(lines.iter().any(|line| line.contains("build graph")));
+        assert!(lines.iter().any(|line| line.contains("system closure")));
+        assert!(lines.iter().all(|line| line.chars().count() <= 64));
+    }
+
+    #[test]
+    fn truncation_keeps_requested_width() {
+        let truncated = truncate_line("abcdefghijklmnopqrstuvwxyz", 12);
+
+        assert_eq!(truncated.chars().count(), 12);
+        assert!(truncated.contains("..."));
+    }
+
+    #[test]
+    fn backend_filter_skips_wrapped_debug_errors() {
+        assert!(!should_print_backend_line(
+            "debug: nixos_rebuild.process: captured output stderr=\"error: noisy\""
+        ));
+        assert!(should_print_backend_line("error: real failure"));
+        assert!(should_print_backend_line("warning: real warning"));
+    }
 }

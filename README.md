@@ -24,14 +24,17 @@ nr publish              Review, commit, and optionally push
 nr check                Run configured checks
 nr doctor               Show target/config/dependency/Git diagnostics
 nr cheat                Show the complete terminal cheat sheet
+man nr                  Show the installed manual page
 ```
 
 ## Rebuild UI
 
-Lifecycle commands use a command UI rather than a full-screen TUI. During a
-build, `nr` reads `nixos-rebuild build --log-format internal-json --verbose`,
-tracks active/completed/failed build activities, groups derivations by broad
-system category, and keeps the full backend stream in a log file.
+Lifecycle commands use a bounded command UI rather than a full-screen TUI.
+During a build, `nr` reads
+`nixos-rebuild build --log-format internal-json --verbose`, tracks
+active/completed/failed build activities, groups derivations by broad system
+category, and repaints a compact rebuild graph. Long derivation names are
+shortened in the terminal; the full backend stream stays in the log file.
 
 After a successful build, `nr` compares `/run/current-system` to the new system
 with `nix store diff-closures`. For `switch`, `test`, and `preview`, it also
@@ -42,8 +45,8 @@ Output modes:
 
 ```text
 --ui auto               Rich output only on interactive terminals
---ui rich               Styled live command UI
---ui plain              Stable script-friendly text
+--ui rich               Styled live rebuild graph
+--ui plain              Stable script-friendly text; no per-event build spam
 --ui raw                Backend output passthrough
 --ui json               Final structured report as JSON
 --log-file PATH         Capture the full backend log at PATH

@@ -24,8 +24,15 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [
+            pkgs.installShellFiles
+            pkgs.makeWrapper
+          ];
           nativeCheckInputs = [ pkgs.git ];
+
+          postInstall = ''
+            installManPage man/nr.1
+          '';
 
           postFixup = ''
             wrapProgram $out/bin/nr \
