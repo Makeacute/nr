@@ -39,6 +39,7 @@ pub struct ActivationImpact {
     pub skipped: Vec<String>,
     pub failed: Vec<String>,
     pub caveats: Vec<String>,
+    pub unavailable: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

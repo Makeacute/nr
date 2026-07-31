@@ -11,9 +11,12 @@ use crate::impact::{
     ActivationImpact, ClosureDiff, current_generation, current_generation_info,
     diff_current_to_new, parse_activation_impact, reboot_recommendation, resolve_result_link,
 };
-use crate::process::{CommandSpec, LogFile, run_capture, run_inherit, stream_command};
+use crate::process::{
+    CommandSpec, LogFile, StreamLine, run_capture, run_inherit, stream_command,
+    stream_command_to_command,
+};
 use crate::prompts::confirm;
-use crate::ui::{RebuildHeader, RebuildReport, Renderer};
+use crate::ui::{OutputMode, RebuildHeader, RebuildReport, Renderer};
 
 pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result<i32> {
     let config = load_config(cli.config_input())?;
@@ -23,7 +26,7 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
     let command_name = if preview { "preview" } else { action };
     let options = cli.backend_options(backend_args);
     let mut log = LogFile::create(cli.log_file.clone())?;
-    let mut renderer = Renderer::new(cli.ui);
+    let mut renderer = Renderer::new_for_lifecycle(cli.ui, command_name);
     let header = RebuildHeader {
         command: command_name.to_string(),
         target: config.target.clone(),
@@ -96,6 +99,7 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
             &options,
             &mut log,
             &mut renderer,
+            !preview,
         )?);
     }
 
@@ -244,33 +248,93 @@ fn stream_nix_build(
     log.write_command(command)?;
     let mut state = BuildState::default();
     let mut fallback_announced = false;
-    let code = stream_command(command, true, |line| {
-        let _ = log.write_line(line.source, &line.line);
-        learn_dependency_graphs(&mut state, &line.line, log);
-        if state.parser_fallback {
-            renderer.backend_line(&line);
-            return;
-        }
-        match parse_line(&line.line) {
-            ParsedLine::Event(event) => {
-                state.ingest(&event);
-                for field in &event.fields {
-                    learn_dependency_graphs(&mut state, field, log);
-                }
-                renderer.nix_event(&event, &state);
-            }
-            ParsedLine::Plain(_) => renderer.backend_line(&line),
-            ParsedLine::BrokenInternalJson(_) => {
-                state.parser_fallback = true;
-                if !fallback_announced {
-                    renderer.parser_fallback();
-                    fallback_announced = true;
-                }
-                renderer.backend_line(&line);
-            }
-        }
-    })?;
+    let code = if renderer.mode() == OutputMode::Nom {
+        let nom_command = backend::nom_json_command();
+        log.write_command(&nom_command)?;
+        stream_command_to_command(
+            command,
+            &nom_command,
+            true,
+            |line| {
+                ingest_build_line(
+                    &mut state,
+                    &line,
+                    log,
+                    renderer,
+                    &mut fallback_announced,
+                    false,
+                    false,
+                );
+            },
+            pipe_line_to_nom,
+        )?
+    } else {
+        stream_command(command, true, |line| {
+            ingest_build_line(
+                &mut state,
+                &line,
+                log,
+                renderer,
+                &mut fallback_announced,
+                true,
+                true,
+            );
+        })?
+    };
     Ok(BuildRun { code, state })
+}
+
+fn ingest_build_line(
+    state: &mut BuildState,
+    line: &StreamLine,
+    log: &mut LogFile,
+    renderer: &mut Renderer,
+    fallback_announced: &mut bool,
+    load_dependency_graph: bool,
+    render_backend: bool,
+) {
+    let _ = log.write_line(line.source, &line.line);
+    if load_dependency_graph {
+        learn_dependency_graphs(state, &line.line, log);
+    } else {
+        state.note_derivation_paths_from_text(&line.line);
+    }
+    if state.parser_fallback {
+        if render_backend {
+            renderer.backend_line(line);
+        }
+        return;
+    }
+    match parse_line(&line.line) {
+        ParsedLine::Event(event) => {
+            state.ingest(&event);
+            for field in &event.fields {
+                if load_dependency_graph {
+                    learn_dependency_graphs(state, field, log);
+                } else {
+                    state.note_derivation_paths_from_text(field);
+                }
+            }
+            if render_backend {
+                renderer.nix_event(&event, state);
+            }
+        }
+        ParsedLine::Plain(_) => {
+            if render_backend {
+                renderer.backend_line(line);
+            }
+        }
+        ParsedLine::BrokenInternalJson(_) => {
+            state.parser_fallback = true;
+            if !*fallback_announced {
+                renderer.parser_fallback();
+                *fallback_announced = true;
+            }
+            if render_backend {
+                renderer.backend_line(line);
+            }
+        }
+    }
 }
 
 fn learn_dependency_graphs(state: &mut BuildState, text: &str, log: &mut LogFile) {
@@ -314,21 +378,32 @@ fn run_dry_activation(
     options: &backend::BackendOptions,
     log: &mut LogFile,
     renderer: &mut Renderer,
+    required: bool,
 ) -> Result<ActivationImpact> {
     let command = backend::nixos_rebuild_dry_activate_command(store_path, options);
     log.write_command(&command)?;
     let output = run_capture(&command, true)?;
     log.write_output(&output)?;
     let combined = format!("{}{}", output.stdout, output.stderr);
-    let impact = parse_activation_impact(&combined);
-    renderer.activation(&impact);
+    let mut impact = parse_activation_impact(&combined);
     if output.code != 0 {
+        impact.unavailable = Some(format!(
+            "nixos-rebuild dry-activate exited with {}",
+            output.code
+        ));
+    }
+    renderer.activation(&impact);
+    if output.code != 0 && required {
         return Err(NrError::CommandFailed {
             command: command.render(),
             code: output.code,
         });
     }
     Ok(impact)
+}
+
+fn pipe_line_to_nom(line: &StreamLine) -> bool {
+    line.line.trim_start().starts_with("@nix ")
 }
 
 struct ReportContext<'a> {

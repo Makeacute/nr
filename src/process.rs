@@ -188,6 +188,96 @@ where
     Ok(status.code().unwrap_or(1))
 }
 
+pub fn stream_command_to_command<F, P>(
+    producer: &CommandSpec,
+    consumer: &CommandSpec,
+    announce: bool,
+    mut on_line: F,
+    mut pipe_line: P,
+) -> Result<i32>
+where
+    F: FnMut(StreamLine),
+    P: FnMut(&StreamLine) -> bool,
+{
+    if announce {
+        println!("-> {} | {}", producer.render(), consumer.render());
+    }
+
+    let mut consumer_child = command_builder(consumer)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|source| spawn_error(consumer, source))?;
+    let mut consumer_stdin = consumer_child.stdin.take().expect("stdin was piped");
+
+    let mut producer_child = match command_builder(producer)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(source) => {
+            drop(consumer_stdin);
+            let _ = consumer_child.kill();
+            let _ = consumer_child.wait();
+            return Err(spawn_error(producer, source));
+        }
+    };
+
+    let stdout = producer_child.stdout.take().expect("stdout was piped");
+    let stderr = producer_child.stderr.take().expect("stderr was piped");
+    let (sender, receiver) = mpsc::channel();
+
+    spawn_reader(stdout, StreamSource::Stdout, sender.clone());
+    spawn_reader(stderr, StreamSource::Stderr, sender.clone());
+    drop(sender);
+
+    let mut pipe_error = None;
+    for line in receiver {
+        if pipe_line(&line)
+            && pipe_error.is_none()
+            && let Err(error) = writeln!(consumer_stdin, "{}", line.line)
+        {
+            pipe_error = Some(error);
+        }
+        on_line(line);
+    }
+    drop(consumer_stdin);
+
+    let producer_status = producer_child
+        .wait()
+        .with_context(format!("failed to wait for {}", producer.render()))?;
+    let consumer_status = consumer_child
+        .wait()
+        .with_context(format!("failed to wait for {}", consumer.render()))?;
+
+    let producer_code = producer_status.code().unwrap_or(1);
+    let consumer_code = consumer_status.code().unwrap_or(1);
+    if producer_code == 0 {
+        if let Some(error) = pipe_error
+            && consumer_code == 0
+        {
+            return Err(NrError::Io {
+                context: format!(
+                    "failed to pipe {} output to {}",
+                    producer.render(),
+                    consumer.render()
+                ),
+                source: error,
+            });
+        }
+        if consumer_code != 0 {
+            return Err(NrError::CommandFailed {
+                command: consumer.render(),
+                code: consumer_code,
+            });
+        }
+    }
+    Ok(producer_code)
+}
+
 fn spawn_reader<R>(reader: R, source: StreamSource, sender: mpsc::Sender<StreamLine>)
 where
     R: io::Read + Send + 'static,

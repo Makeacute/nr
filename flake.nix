@@ -41,6 +41,7 @@
                   pkgs.gh
                   pkgs.git
                   pkgs.nix
+                  pkgs.nix-output-monitor
                   pkgs.nixos-rebuild
                   pkgs.nixfmt
                   pkgs.statix
@@ -80,6 +81,7 @@
               gh
               git
               nix
+              nix-output-monitor
               nixos-rebuild
               nixfmt
               rustc

@@ -108,6 +108,10 @@ pub fn nix_store_query_graph_command(path: &str) -> CommandSpec {
     ])
 }
 
+pub fn nom_json_command() -> CommandSpec {
+    CommandSpec::new("nom").arg("--json")
+}
+
 pub fn nix_flake_update_command(
     target: &FlakeTarget,
     inputs: &[String],

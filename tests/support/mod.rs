@@ -63,6 +63,7 @@ pub fn fake_bin() -> (TestDir, PathBuf, PathBuf) {
 echo "nixos-rebuild $*" >> "$NR_FAKE_LOG"
 case "${1:-}" in
   build)
+    echo "debug: fake backend noise" >&2
     echo "these derivations will be built:" >&2
     echo "  /nix/store/root-nixos-system-host.drv" >&2
     echo '@nix {"action":"start","id":1,"type":105,"text":"building '\''/nix/store/aaa-linux.drv'\''","fields":[]}' >&2
@@ -74,6 +75,10 @@ case "${1:-}" in
     ln -sfn /nix/store/fake-system "$PWD/result"
     ;;
   dry-activate)
+    if [ "${NR_FAKE_DRY_ACTIVATE_FAIL:-0}" = 1 ]; then
+      echo "Failed to start transient service unit: Access denied" >&2
+      exit 55
+    fi
     echo "would restart the following units: sshd.service display-manager.service"
     ;;
   switch|test|boot)
@@ -143,6 +148,31 @@ case "$*" in
   *)
     echo "unexpected nix command: $*" >&2
     exit 98
+    ;;
+esac
+"#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("nom"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+echo "nom $*" >> "$NR_FAKE_LOG"
+case "$*" in
+  "--json")
+    while IFS= read -r line; do
+      echo "nom-input $line" >> "$NR_FAKE_LOG"
+      case "$line" in
+        @nix*) echo "nom: $line" ;;
+      esac
+    done
+    ;;
+  *)
+    echo "unexpected nom command: $*" >&2
+    exit 96
     ;;
 esac
 "#,

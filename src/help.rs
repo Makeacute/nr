@@ -38,8 +38,8 @@ TARGET SELECTION
   ~/.config/nr/config.toml User defaults.
 
 COMMON FLAGS
-  --ui auto|rich|plain|raw|json
-                           Select command output mode. Rich mode shows a dependency graph.
+  --ui auto|rich|nom|plain|raw|json
+                           Select command output mode. auto uses nom for interactive lifecycle builds.
   --log-file PATH          Capture the full backend log at PATH.
   --dry                    Alias lifecycle commands to preview-style behavior.
   --ask                    Ask before activation.

@@ -1,5 +1,6 @@
 use nr::backend::{
-    BackendOptions, nix_store_diff_closures_command, nixos_rebuild_build_command, rollback_command,
+    BackendOptions, nix_store_diff_closures_command, nixos_rebuild_build_command, nom_json_command,
+    rollback_command,
 };
 use nr::cli::{Cli, NrCommand};
 use nr::config::FlakeTarget;
@@ -47,6 +48,14 @@ fn rollback_is_official_previous_generation_only() {
     assert_eq!(
         command.to_vec(),
         ["nixos-rebuild", "switch", "--rollback"].map(String::from)
+    );
+}
+
+#[test]
+fn nom_command_consumes_internal_json_logs() {
+    assert_eq!(
+        nom_json_command().to_vec(),
+        ["nom", "--json"].map(String::from)
     );
 }
 

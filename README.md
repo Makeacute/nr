@@ -4,8 +4,9 @@
 `nixos-rebuild`, parses Nix internal JSON build events itself, explains closure
 and activation impact, and exits with the real backend status code.
 
-The v2 direction keeps rebuild rendering inside `nr`: no delegated rebuild UI
-and no manual profile editing for rollback.
+The default v2 direction keeps rebuild rendering inside `nr`; `--ui nom`
+is available for users who want the `nix-output-monitor` build tree.
+Rollback avoids manual profile editing.
 
 ## Commands
 
@@ -45,8 +46,9 @@ reload.
 Output modes:
 
 ```text
---ui auto               Rich output only on interactive terminals
+--ui auto               nom for interactive lifecycle builds; plain otherwise
 --ui rich               Styled live rebuild graph
+--ui nom                Pipe build logs through nom --json for an nh-like tree
 --ui plain              Stable script-friendly text; no per-event build spam
 --ui raw                Backend output passthrough
 --ui json               Final structured report as JSON

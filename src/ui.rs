@@ -16,6 +16,7 @@ use crate::process::{StreamLine, StreamSource};
 pub enum OutputMode {
     Auto,
     Rich,
+    Nom,
     Plain,
     Raw,
     Json,
@@ -26,6 +27,7 @@ impl OutputMode {
         match value {
             "auto" => Some(Self::Auto),
             "rich" => Some(Self::Rich),
+            "nom" => Some(Self::Nom),
             "plain" => Some(Self::Plain),
             "raw" => Some(Self::Raw),
             "json" => Some(Self::Json),
@@ -34,8 +36,27 @@ impl OutputMode {
     }
 
     pub fn effective(self) -> Self {
+        self.effective_with_terminal(io::stdout().is_terminal() && io::stderr().is_terminal())
+    }
+
+    pub fn effective_for_lifecycle(self, action: &str) -> Self {
+        self.effective_for_lifecycle_with_terminal(
+            action,
+            io::stdout().is_terminal() && io::stderr().is_terminal(),
+        )
+    }
+
+    pub fn effective_for_lifecycle_with_terminal(self, action: &str, interactive: bool) -> Self {
         match self {
-            Self::Auto if io::stdout().is_terminal() && io::stderr().is_terminal() => Self::Rich,
+            Self::Auto if interactive && uses_build_ui_by_default(action) => Self::Nom,
+            Self::Auto => self.effective_with_terminal(interactive),
+            value => value,
+        }
+    }
+
+    fn effective_with_terminal(self, interactive: bool) -> Self {
+        match self {
+            Self::Auto if interactive => Self::Rich,
             Self::Auto => Self::Plain,
             value => value,
         }
@@ -82,6 +103,14 @@ impl Renderer {
         }
     }
 
+    pub fn new_for_lifecycle(mode: OutputMode, action: &str) -> Self {
+        Self {
+            mode: mode.effective_for_lifecycle(action),
+            last_rich_render: Instant::now() - Duration::from_secs(1),
+            last_rich_lines: 0,
+        }
+    }
+
     pub fn start(&mut self, header: &RebuildHeader) {
         match self.mode {
             OutputMode::Json => {}
@@ -92,7 +121,7 @@ impl Renderer {
                 println!("nr {} {}", header.command, header.target.reference());
                 print_header_details(header);
             }
-            OutputMode::Rich | OutputMode::Auto => {
+            OutputMode::Rich | OutputMode::Nom | OutputMode::Auto => {
                 println!(
                     "\x1b[1;36mnr {}\x1b[0m {}",
                     header.command,
@@ -107,6 +136,7 @@ impl Renderer {
         match self.mode {
             OutputMode::Json | OutputMode::Raw => {}
             OutputMode::Plain => println!("phase: {phase}"),
+            OutputMode::Nom => println!("\x1b[1;34m{phase}\x1b[0m"),
             OutputMode::Rich | OutputMode::Auto => {
                 self.clear_rich_block();
                 println!("\x1b[1;34m{phase}\x1b[0m");
@@ -117,7 +147,7 @@ impl Renderer {
     pub fn nix_event(&mut self, _event: &NixEvent, state: &BuildState) {
         match self.mode {
             OutputMode::Rich | OutputMode::Auto => self.render_rich_state(state),
-            OutputMode::Plain => {}
+            OutputMode::Nom | OutputMode::Plain => {}
             OutputMode::Raw | OutputMode::Json => {}
         }
     }
@@ -128,7 +158,7 @@ impl Renderer {
                 StreamSource::Stdout => println!("{}", line.line),
                 StreamSource::Stderr => eprintln!("{}", line.line),
             },
-            OutputMode::Rich | OutputMode::Plain | OutputMode::Auto => {
+            OutputMode::Rich | OutputMode::Nom | OutputMode::Plain | OutputMode::Auto => {
                 if should_print_backend_line(&line.line) {
                     if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
                         self.clear_rich_block();
@@ -145,7 +175,11 @@ impl Renderer {
             if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
                 self.clear_rich_block();
             }
-            eprintln!("Nix JSON output changed; falling back to plain log streaming.");
+            if self.mode == OutputMode::Nom {
+                eprintln!("Nix JSON output changed; nom output may be incomplete.");
+            } else {
+                eprintln!("Nix JSON output changed; falling back to plain log streaming.");
+            }
         }
     }
 
@@ -187,7 +221,7 @@ impl Renderer {
         match self.mode {
             OutputMode::Json => println!("{}", report_json(report)),
             OutputMode::Raw => {}
-            OutputMode::Plain | OutputMode::Rich | OutputMode::Auto => {
+            OutputMode::Plain | OutputMode::Rich | OutputMode::Nom | OutputMode::Auto => {
                 if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
                     self.clear_rich_block();
                 }
@@ -203,6 +237,10 @@ impl Renderer {
                 println!("log: {}", report.log_path.display());
             }
         }
+    }
+
+    pub fn mode(&self) -> OutputMode {
+        self.mode
     }
 
     fn render_rich_state(&mut self, state: &BuildState) {
@@ -229,6 +267,10 @@ impl Renderer {
         self.last_rich_lines = 0;
         let _ = io::stdout().flush();
     }
+}
+
+fn uses_build_ui_by_default(action: &str) -> bool {
+    matches!(action, "build" | "switch" | "test" | "boot" | "preview")
 }
 
 fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
@@ -502,6 +544,9 @@ fn print_diff_summary(diff: &ClosureDiff) {
 
 fn print_activation_summary(impact: &ActivationImpact) {
     println!("activation impact:");
+    if let Some(reason) = &impact.unavailable {
+        println!("  unavailable: {reason}");
+    }
     print_units("stopped", &impact.stopped);
     print_units("started", &impact.started);
     print_units("restarted", &impact.restarted);
@@ -548,6 +593,7 @@ fn report_json(report: &RebuildReport) -> String {
             "reloaded": activation.reloaded,
             "skipped": activation.skipped,
             "failed": activation.failed,
+            "unavailable": activation.unavailable,
         })
     });
 
@@ -582,7 +628,37 @@ mod tests {
 
     use crate::events::{Activity, ActivityStatus, BuildCategory, BuildState};
 
-    use super::{build_graph_lines, should_print_backend_line, truncate_line};
+    use super::{OutputMode, build_graph_lines, should_print_backend_line, truncate_line};
+
+    #[test]
+    fn auto_uses_nom_for_interactive_lifecycle_builds() {
+        for action in ["build", "switch", "test", "boot", "preview"] {
+            assert_eq!(
+                OutputMode::Auto.effective_for_lifecycle_with_terminal(action, true),
+                OutputMode::Nom
+            );
+        }
+    }
+
+    #[test]
+    fn auto_preserves_plain_for_noninteractive_lifecycle_output() {
+        assert_eq!(
+            OutputMode::Auto.effective_for_lifecycle_with_terminal("switch", false),
+            OutputMode::Plain
+        );
+    }
+
+    #[test]
+    fn explicit_lifecycle_output_mode_wins_over_auto_policy() {
+        assert_eq!(
+            OutputMode::Rich.effective_for_lifecycle_with_terminal("switch", true),
+            OutputMode::Rich
+        );
+        assert_eq!(
+            OutputMode::Json.effective_for_lifecycle_with_terminal("switch", true),
+            OutputMode::Json
+        );
+    }
 
     #[test]
     fn graph_lines_are_bounded() {

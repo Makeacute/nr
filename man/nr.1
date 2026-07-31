@@ -112,10 +112,18 @@ Pass remaining arguments directly to the backend command.
 .SH OUTPUT MODES
 .TP
 .B auto
-Use rich output on interactive terminals and plain output otherwise.
+Use
+.B nom
+for interactive lifecycle builds and plain output otherwise.
 .TP
 .B rich
 Show a styled, bounded live derivation dependency graph plus summaries.
+.TP
+.B nom
+Pipe build logs through
+.BR "nom --json"
+for an nh-like build tree. Requires
+.BR nix-output-monitor .
 .TP
 .B plain
 Print stable script-friendly summaries and warnings or errors only.
