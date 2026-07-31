@@ -1,5 +1,5 @@
 {
-  description = "A safe, Git-aware NixOS rebuild helper";
+  description = "A safe, Git-aware NixOS lifecycle CLI";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -15,26 +15,17 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          version = builtins.head (
-            builtins.match ''__version__ = "([^"]+)"[[:space:]]*'' (builtins.readFile ./src/nr/version.py)
-          );
+          cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
         in
-        pkgs.python3Packages.buildPythonApplication {
+        pkgs.rustPlatform.buildRustPackage {
           pname = "nr";
-          inherit version;
-          pyproject = true;
+          version = cargoToml.package.version;
           src = nixpkgs.lib.cleanSource ./.;
 
-          build-system = [ pkgs.python3Packages.setuptools ];
+          cargoLock.lockFile = ./Cargo.lock;
+
           nativeBuildInputs = [ pkgs.makeWrapper ];
           nativeCheckInputs = [ pkgs.git ];
-
-          pythonImportsCheck = [ "nr" ];
-          checkPhase = ''
-            runHook preCheck
-            PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
-            runHook postCheck
-          '';
 
           postFixup = ''
             wrapProgram $out/bin/nr \
@@ -42,10 +33,9 @@
                 pkgs.lib.makeBinPath [
                   pkgs.gh
                   pkgs.git
-                  pkgs.nh
                   pkgs.nix
+                  pkgs.nixos-rebuild
                   pkgs.nixfmt
-                  pkgs.ruff
                   pkgs.statix
                 ]
               }
@@ -78,13 +68,15 @@
         {
           default = pkgs.mkShellNoCC {
             packages = with pkgs; [
+              cargo
+              clippy
               gh
               git
-              nh
               nix
+              nixos-rebuild
               nixfmt
-              python3
-              ruff
+              rustc
+              rustfmt
               statix
             ];
           };

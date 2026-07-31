@@ -1,0 +1,6 @@
+[package]
+name = "nr"
+version = "0.2.0"
+edition = "2024"
+description = "A safe, Git-aware NixOS lifecycle CLI"
+license = "MIT"

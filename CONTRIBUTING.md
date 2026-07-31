@@ -7,8 +7,9 @@ tradeoffs.
 
 ```console
 nix develop
-PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
-ruff check src tests
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
 nix flake check
 nix run . -- cheat
 nix run . -- doctor --flake .
@@ -16,8 +17,8 @@ nix run . -- doctor --flake .
 
 ## Design rules
 
-- Lifecycle commands may call `nh` and `nix`, but they must not stage, commit,
-  push, or otherwise mutate Git.
+- Lifecycle commands may call `nixos-rebuild` and `nix`, but they must not
+  stage, commit, push, or otherwise mutate Git.
 - `publish` is the only command that may create commits or push.
 - Custom checks must be argument arrays from TOML, not shell strings.
 - Use full command names. Do not add short aliases such as `nrb`.

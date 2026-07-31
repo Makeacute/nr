@@ -1,9 +1,9 @@
-import argparse
+use crate::errors::Result;
 
-
-def command_cheat(_args: argparse.Namespace) -> int:
-    print(
-        """
+pub fn run_cheat() -> Result<i32> {
+    println!(
+        "{}",
+        r#"
 nr - NixOS lifecycle helper
 
 CORE
@@ -11,15 +11,16 @@ CORE
   nr switch                Build and activate the selected host.
   nr test                  Build and activate until the next reboot.
   nr boot                  Build and make the generation the next boot default.
-  nr rollback              Roll back with nh.
-  nr generations           Show NixOS generations with nh.
+  nr preview               Build, diff, and dry-activate without mutating.
+  nr rollback              Roll back to the previous generation.
+  nr generations           Show NixOS generations.
 
 UPDATES AND CHECKS
   nr update                Update flake.lock only.
   nr update nixpkgs        Update one flake input.
   nr update --switch       Update flake.lock, then build and activate.
   nr check                 Run configured checks. Default: nix flake check.
-  nr check --all           Also run nixfmt, statix, and ruff when files exist.
+  nr check --all           Also run nixfmt, statix, cargo fmt, and clippy.
   nr doctor                Show target, config, dependency, and Git diagnostics.
 
 PUBLISHING
@@ -37,17 +38,22 @@ TARGET SELECTION
   ~/.config/nr/config.toml User defaults.
 
 COMMON FLAGS
-  --dry                    Forward dry-run behavior to nh/nix where supported.
-  --ask                    Ask before nh activation steps.
-  --offline                Forward offline mode to nix-backed commands.
+  --ui auto|rich|plain|raw|json
+                           Select command output mode.
+  --log-file PATH          Capture the full backend log at PATH.
+  --dry                    Alias lifecycle commands to preview-style behavior.
+  --ask                    Ask before activation.
+  --offline                Forward offline mode to Nix.
   --show-trace             Forward Nix traces.
-  --specialisation NAME    Activate/build a specialisation through nh.
+  --specialisation NAME    Build or activate a specialisation.
   --                       Pass remaining arguments directly to the backend.
 
 WORKFLOWS
   Validate:                nr check --all -> nr build
-  Apply:                   nr switch -> nr publish
-  Update safely:           nr update -> nr build -> nr switch -> nr publish
-""".strip()
-    )
-    return 0
+  Preview:                 nr preview -> nr switch
+  Update safely:           nr update -> nr preview -> nr switch -> nr publish
+"#
+        .trim()
+    );
+    Ok(0)
+}
