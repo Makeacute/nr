@@ -85,3 +85,31 @@ fn cli_exposes_preview_and_global_target_options() {
     };
     assert_eq!(args.backend_args, ["--fast"].map(String::from));
 }
+
+#[test]
+fn cli_accepts_equals_forms_globals_after_command_and_verbose_count() {
+    let cli = Cli::parse_from([
+        "nr",
+        "build",
+        "--flake=/one#host",
+        "--ui=plain",
+        "-vvv",
+        "--",
+        "--fast",
+    ])
+    .unwrap();
+
+    assert_eq!(cli.flake.as_deref(), Some("/one#host"));
+    assert_eq!(cli.verbose, 3);
+    let Some(NrCommand::Build(args)) = cli.command else {
+        panic!("expected build");
+    };
+    assert_eq!(args.backend_args, ["--fast"].map(String::from));
+}
+
+#[test]
+fn cli_reports_missing_values() {
+    let error = Cli::parse_from(["nr", "--flake"]).unwrap_err().to_string();
+
+    assert!(error.contains("a value is required"));
+}

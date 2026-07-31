@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Instant;
+
+use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NixEvent {
@@ -19,7 +23,15 @@ pub enum ParsedLine {
     BrokenInternalJson(String),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActivityStatus {
+    #[default]
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Activity {
     pub id: u64,
     pub parent: Option<u64>,
@@ -27,6 +39,8 @@ pub struct Activity {
     pub category: BuildCategory,
     pub source_build: bool,
     pub substitute: bool,
+    pub status: ActivityStatus,
+    pub started_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,7 +51,7 @@ pub enum BuildCategory {
     Libraries,
     DevTools,
     #[default]
-    Unknown,
+    Other,
 }
 
 impl BuildCategory {
@@ -48,7 +62,7 @@ impl BuildCategory {
             Self::Services => "services",
             Self::Libraries => "libraries",
             Self::DevTools => "dev tools",
-            Self::Unknown => "unknown",
+            Self::Other => "other",
         }
     }
 }
@@ -57,6 +71,7 @@ impl BuildCategory {
 pub struct BuildState {
     pub phase: String,
     pub running: BTreeMap<u64, Activity>,
+    pub nodes: BTreeMap<u64, Activity>,
     pub completed: usize,
     pub failed: usize,
     pub downloads: usize,
@@ -88,14 +103,31 @@ impl BuildState {
     }
 
     pub fn slowest_active(&self) -> Option<&Activity> {
-        self.running.values().next()
+        self.running
+            .values()
+            .max_by_key(|activity| activity.started_at.elapsed())
+    }
+
+    pub fn active_lineage_ids(&self) -> BTreeSet<u64> {
+        let mut ids = BTreeSet::new();
+        for activity in self.running.values() {
+            ids.insert(activity.id);
+            let mut parent = activity.parent;
+            while let Some(parent_id) = parent {
+                if !ids.insert(parent_id) {
+                    break;
+                }
+                parent = self.nodes.get(&parent_id).and_then(|node| node.parent);
+            }
+        }
+        ids
     }
 
     pub fn why_building(&self, activity: &Activity) -> Option<String> {
         let mut parent = activity.parent;
         let mut chain = VecDeque::new();
         while let Some(parent_id) = parent {
-            let Some(parent_activity) = self.running.get(&parent_id) else {
+            let Some(parent_activity) = self.nodes.get(&parent_id) else {
                 break;
             };
             chain.push_front(parent_activity.text.clone());
@@ -105,7 +137,7 @@ impl BuildState {
             None
         } else {
             Some(format!(
-                "dependency of {}",
+                "event parent path: {}",
                 chain.into_iter().collect::<Vec<_>>().join(" -> ")
             ))
         }
@@ -126,25 +158,41 @@ impl BuildState {
             if is_download(&text) {
                 self.downloads += 1;
             }
-            self.running.insert(
+            let activity = Activity {
                 id,
-                Activity {
-                    id,
-                    parent: event.parent,
-                    category: categorize(&text),
-                    text,
-                    source_build,
-                    substitute,
-                },
-            );
+                parent: event.parent,
+                category: categorize(&text),
+                text,
+                source_build,
+                substitute,
+                status: ActivityStatus::Running,
+                started_at: Instant::now(),
+            };
+            self.nodes.insert(id, activity.clone());
+            self.running.insert(id, activity);
         }
     }
 
     fn stop(&mut self, event: &NixEvent) {
-        if let Some(id) = event.id
-            && self.running.remove(&id).is_some()
-        {
-            self.completed += 1;
+        if let Some(id) = event.id {
+            let completed = self
+                .running
+                .get(&id)
+                .is_some_and(|activity| activity.status != ActivityStatus::Failed);
+            if let Some(mut activity) = self.running.remove(&id) {
+                if activity.status != ActivityStatus::Failed {
+                    activity.status = ActivityStatus::Completed;
+                }
+                self.nodes.insert(id, activity);
+                if completed {
+                    self.completed += 1;
+                }
+            } else if let Some(activity) = self.nodes.get_mut(&id)
+                && activity.status == ActivityStatus::Running
+            {
+                activity.status = ActivityStatus::Completed;
+                self.completed += 1;
+            }
         }
     }
 
@@ -154,6 +202,14 @@ impl BuildState {
         if lower.contains("failed") || lower.contains("error") {
             self.failed += 1;
             self.errors.push(text);
+            if let Some(id) = event.id {
+                if let Some(activity) = self.running.get_mut(&id) {
+                    activity.status = ActivityStatus::Failed;
+                }
+                if let Some(activity) = self.nodes.get_mut(&id) {
+                    activity.status = ActivityStatus::Failed;
+                }
+            }
         }
     }
 
@@ -168,6 +224,19 @@ impl BuildState {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct RawNixEvent {
+    action: Option<String>,
+    id: Option<u64>,
+    parent: Option<u64>,
+    #[serde(rename = "type")]
+    activity_type: Option<u64>,
+    level: Option<u64>,
+    text: Option<String>,
+    msg: Option<String>,
+    fields: Option<Vec<Value>>,
+}
+
 pub fn parse_line(line: &str) -> ParsedLine {
     let trimmed = line.trim_start();
     let (json_text, internal) = if let Some(rest) = trimmed.strip_prefix("@nix ") {
@@ -178,27 +247,32 @@ pub fn parse_line(line: &str) -> ParsedLine {
         return ParsedLine::Plain(line.to_string());
     };
 
-    if !(json_text.starts_with('{') && json_text.ends_with('}')) {
-        return if internal {
-            ParsedLine::BrokenInternalJson(line.to_string())
-        } else {
-            ParsedLine::Plain(line.to_string())
-        };
-    }
-
-    let action = json_string_field(json_text, "action").unwrap_or_else(|| "unknown".to_string());
-    let fields = json_string_array_field(json_text, "fields");
-    let text = json_string_field(json_text, "text")
-        .or_else(|| json_string_field(json_text, "msg"))
+    let raw = match serde_json::from_str::<RawNixEvent>(json_text) {
+        Ok(raw) => raw,
+        Err(_) if internal => return ParsedLine::BrokenInternalJson(line.to_string()),
+        Err(_) => return ParsedLine::Plain(line.to_string()),
+    };
+    let fields = raw
+        .fields
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| match value {
+            Value::String(value) => value,
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let text = raw
+        .text
+        .or(raw.msg)
         .or_else(|| fields.first().cloned())
         .unwrap_or_default();
 
     ParsedLine::Event(NixEvent {
-        action,
-        id: json_u64_field(json_text, "id"),
-        parent: json_u64_field(json_text, "parent"),
-        activity_type: json_u64_field(json_text, "type"),
-        level: json_u64_field(json_text, "level"),
+        action: raw.action.unwrap_or_else(|| "unknown".to_string()),
+        id: raw.id,
+        parent: raw.parent,
+        activity_type: raw.activity_type,
+        level: raw.level,
         text,
         fields,
         raw: json_text.to_string(),
@@ -215,7 +289,28 @@ pub fn categorize(text: &str) -> BuildCategory {
     } else if contains_any(
         &lower,
         &[
-            "gnome", "kde", "plasma", "xorg", "wayland", "sddm", "gdm", "mesa", "nvidia",
+            "gnome",
+            "kde",
+            "plasma",
+            "xorg",
+            "xwayland",
+            "wayland",
+            "wlroots",
+            "sddm",
+            "gdm",
+            "display-manager",
+            "mesa",
+            "nvidia",
+            "niri",
+            "quickshell",
+            "hyprland",
+            "sway",
+            "waybar",
+            "gtk",
+            "qtbase",
+            "qtwayland",
+            "qtdeclarative",
+            "qt-",
         ],
     ) {
         BuildCategory::DesktopStack
@@ -229,117 +324,8 @@ pub fn categorize(text: &str) -> BuildCategory {
     } else if contains_any(&lower, &["lib", "openssl", "glibc", "zlib"]) {
         BuildCategory::Libraries
     } else {
-        BuildCategory::Unknown
+        BuildCategory::Other
     }
-}
-
-fn json_string_field(json: &str, key: &str) -> Option<String> {
-    let value_start = find_json_value(json, key)?;
-    let bytes = json.as_bytes();
-    if bytes.get(value_start) != Some(&b'"') {
-        return None;
-    }
-    parse_json_string(json, value_start).map(|(value, _)| value)
-}
-
-fn json_u64_field(json: &str, key: &str) -> Option<u64> {
-    let mut index = find_json_value(json, key)?;
-    let bytes = json.as_bytes();
-    while bytes
-        .get(index)
-        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
-    {
-        index += 1;
-    }
-    let start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
-    }
-    if start == index {
-        None
-    } else {
-        json[start..index].parse().ok()
-    }
-}
-
-fn json_string_array_field(json: &str, key: &str) -> Vec<String> {
-    let Some(mut index) = find_json_value(json, key) else {
-        return Vec::new();
-    };
-    let bytes = json.as_bytes();
-    if bytes.get(index) != Some(&b'[') {
-        return Vec::new();
-    }
-    index += 1;
-    let mut values = Vec::new();
-    while index < bytes.len() {
-        while bytes
-            .get(index)
-            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | b','))
-        {
-            index += 1;
-        }
-        match bytes.get(index) {
-            Some(b'"') => match parse_json_string(json, index) {
-                Some((value, next)) => {
-                    values.push(value);
-                    index = next;
-                }
-                None => break,
-            },
-            Some(b']') | None => break,
-            _ => {
-                while bytes
-                    .get(index)
-                    .is_some_and(|byte| !matches!(byte, b',' | b']'))
-                {
-                    index += 1;
-                }
-            }
-        }
-    }
-    values
-}
-
-fn find_json_value(json: &str, key: &str) -> Option<usize> {
-    let needle = format!("\"{key}\"");
-    let key_index = json.find(&needle)?;
-    let after_key = key_index + needle.len();
-    let colon_offset = json[after_key..].find(':')?;
-    let mut index = after_key + colon_offset + 1;
-    let bytes = json.as_bytes();
-    while bytes
-        .get(index)
-        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
-    {
-        index += 1;
-    }
-    Some(index)
-}
-
-fn parse_json_string(json: &str, start: usize) -> Option<(String, usize)> {
-    let mut escaped = false;
-    let mut output = String::new();
-    for (offset, character) in json[start + 1..].char_indices() {
-        if escaped {
-            output.push(match character {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                '"' => '"',
-                '\\' => '\\',
-                other => other,
-            });
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '"' {
-            return Some((output, start + 1 + offset + 1));
-        } else {
-            output.push(character);
-        }
-    }
-    None
 }
 
 fn event_text(event: &NixEvent) -> String {
@@ -364,7 +350,7 @@ fn classify_phase(text: &str) -> &'static str {
 
 fn is_source_build(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("building") || lower.contains(".drv")
+    !is_substitute(&lower) && (lower.contains("building") || lower.contains(".drv"))
 }
 
 fn is_substitute(text: &str) -> bool {

@@ -204,23 +204,52 @@ pub fn current_branch(flake_path: &Path) -> Result<String> {
 }
 
 pub fn git_summary(flake_path: &Path) -> GitSummary {
-    if !is_git_repository(flake_path) {
-        return GitSummary {
-            repository: false,
-            branch: None,
-            dirty: false,
-            untracked: 0,
-        };
+    let output = run_capture(
+        &git_command(flake_path, &["status", "--porcelain=v2", "--branch", "-z"]),
+        false,
+    );
+    let Ok(output) = output else {
+        return not_a_repository();
+    };
+    if output.code != 0 {
+        return not_a_repository();
     }
-    let branch = current_branch(flake_path).ok();
-    let status = status_short(flake_path).unwrap_or_default();
-    let untracked = untracked_files(flake_path)
-        .map(|items| items.len())
-        .unwrap_or(0);
+    parse_git_summary(&output.stdout)
+}
+
+fn not_a_repository() -> GitSummary {
+    GitSummary {
+        repository: false,
+        branch: None,
+        dirty: false,
+        untracked: 0,
+    }
+}
+
+fn parse_git_summary(output: &str) -> GitSummary {
+    let mut branch = None;
+    let mut dirty = false;
+    let mut untracked = 0usize;
+
+    for record in output.split('\0').filter(|record| !record.is_empty()) {
+        if let Some(value) = record.strip_prefix("# branch.head ") {
+            if value != "(detached)" {
+                branch = Some(value.to_string());
+            }
+            continue;
+        }
+        if record.starts_with("? ") {
+            untracked += 1;
+            dirty = true;
+        } else if record.starts_with("1 ") || record.starts_with("2 ") || record.starts_with("u ") {
+            dirty = true;
+        }
+    }
+
     GitSummary {
         repository: true,
         branch,
-        dirty: !status.trim().is_empty(),
+        dirty,
         untracked,
     }
 }
@@ -250,4 +279,23 @@ pub fn push_command(flake_path: &Path, args: &[String]) -> CommandSpec {
 
 pub fn path_from_string(value: &str) -> PathBuf {
     PathBuf::from(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_git_summary;
+
+    #[test]
+    fn parses_porcelain_v2_branch_dirty_and_untracked() {
+        let summary = parse_git_summary(
+            "# branch.head main\0\
+             1 .M N... 100644 100644 100644 a b file\0\
+             ? new\0",
+        );
+
+        assert!(summary.repository);
+        assert_eq!(summary.branch.as_deref(), Some("main"));
+        assert!(summary.dirty);
+        assert_eq!(summary.untracked, 1);
+    }
 }

@@ -17,6 +17,9 @@ closure and activation impact, and preserve the backend exit code.
 The full backend stream is captured in a log file. Terminal output is intended
 to answer what is changing, what is currently building or fetching, what
 activation would do, and how to recover.
+.PP
+The rich rebuild graph is built from Nix activity parent and child events. It
+is not a full derivation dependency graph.
 .SH COMMANDS
 .TP
 .B build
@@ -111,7 +114,7 @@ Pass remaining arguments directly to the backend command.
 Use rich output on interactive terminals and plain output otherwise.
 .TP
 .B rich
-Show a styled, bounded live rebuild graph plus summaries.
+Show a styled, bounded live Nix activity graph plus summaries.
 .TP
 .B plain
 Print stable script-friendly summaries and warnings or errors only.

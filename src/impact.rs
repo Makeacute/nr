@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -301,15 +302,8 @@ fn extend_units(target: &mut Vec<String>, units: Vec<&str>) {
 }
 
 fn dedup(values: &mut Vec<String>) {
-    let mut seen = Vec::new();
-    values.retain(|value| {
-        if seen.contains(value) {
-            false
-        } else {
-            seen.push(value.clone());
-            true
-        }
-    });
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {

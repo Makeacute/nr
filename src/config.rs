@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
 
 use crate::errors::{IoContext, NrError, Result};
 
@@ -73,29 +74,37 @@ pub struct ConfigInput {
     pub hostname: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct ConfigData {
-    values: BTreeMap<(String, String), ConfigValue>,
+    target: TargetConfig,
+    check: CheckConfig,
+    publish: PublishConfig,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ConfigValue {
-    String(String),
-    Bool(bool),
-    Commands(Vec<CheckCommand>),
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TargetConfig {
+    flake: Option<String>,
+    host: Option<String>,
 }
 
-const TOP_LEVEL_KEYS: &[&str] = &["target", "check", "publish"];
-const TARGET_KEYS: &[&str] = &["flake", "host"];
-const CHECK_KEYS: &[&str] = &[
-    "flake",
-    "nixfmt",
-    "statix",
-    "cargo_fmt",
-    "clippy",
-    "commands",
-];
-const PUBLISH_KEYS: &[&str] = &["remote"];
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CheckConfig {
+    flake: Option<bool>,
+    nixfmt: Option<bool>,
+    statix: Option<bool>,
+    cargo_fmt: Option<bool>,
+    clippy: Option<bool>,
+    commands: Option<Vec<CheckCommand>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PublishConfig {
+    remote: Option<String>,
+}
 
 pub fn find_flake(start: &Path) -> Option<PathBuf> {
     let mut current = absolute_path(start);
@@ -177,7 +186,7 @@ pub fn load_config(input: ConfigInput) -> Result<NrConfig> {
             user_path,
             user_data,
         );
-    } else if let Some(value) = string_value(&user_data, "target", "flake")? {
+    } else if let Some(value) = target_flake(&user_data)? {
         raw_flake = Some(value);
         raw_flake_base = user_path.parent().map(Path::to_path_buf);
     }
@@ -219,14 +228,10 @@ fn finish_config(
 
     let repo_path = flake_path.join(".nr.toml");
     let repo_data = read_config(&repo_path)?;
-    if string_value(&repo_data, "target", "flake")?.is_some() {
-        return Err(NrError::message(
-            ".nr.toml cannot set [target].flake; it already lives in the flake.",
-        ));
-    }
+    reject_repo_flake(&repo_data)?;
 
-    let repo_host = string_value(&repo_data, "target", "host")?;
-    let user_host = string_value(&user_data, "target", "host")?;
+    let repo_host = target_host(&repo_data)?;
+    let user_host = target_host(&user_data)?;
     let selected_host = cli_host
         .filter(|value| !value.trim().is_empty())
         .or(fragment_host)
@@ -248,11 +253,11 @@ fn finish_config(
     let mut check = CheckSettings::default();
     let mut publish = PublishSettings::default();
     if let Some(data) = &user_data {
-        check = merge_check_settings(check, data)?;
+        check = merge_check_settings(check, data);
         publish = merge_publish_settings(publish, data)?;
     }
     if let Some(data) = &repo_data {
-        check = merge_check_settings(check, data)?;
+        check = merge_check_settings(check, data);
         publish = merge_publish_settings(publish, data)?;
     }
 
@@ -263,8 +268,8 @@ fn finish_config(
         },
         check,
         publish,
-        user_config_path: user_data.map(|_| user_path),
-        repo_config_path: repo_data.map(|_| repo_path),
+        user_config_path: user_data.as_ref().map(|_| user_path),
+        repo_config_path: repo_data.as_ref().map(|_| repo_path),
     })
 }
 
@@ -274,303 +279,79 @@ fn read_config(path: &Path) -> Result<Option<ConfigData>> {
     }
     let text =
         fs::read_to_string(path).with_context(format!("failed to read {}", path.display()))?;
-    parse_config(path, &text).map(Some)
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|error| NrError::message(format!("Invalid config in {}: {error}", path.display())))
 }
 
-fn parse_config(path: &Path, text: &str) -> Result<ConfigData> {
-    let mut data = ConfigData::default();
-    let mut section = String::new();
-    let mut lines = text.lines().enumerate().peekable();
-    let mut sections = BTreeSet::new();
-
-    while let Some((line_number, raw_line)) = lines.next() {
-        let line = strip_comment(raw_line).trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            section = line[1..line.len() - 1].trim().to_string();
-            validate_section(path, &section)?;
-            sections.insert(section.clone());
-            continue;
-        }
-        if section.is_empty() {
-            return Err(NrError::message(format!(
-                "Key outside a section in {}:{}",
-                path.display(),
-                line_number + 1
-            )));
-        }
-
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(NrError::message(format!(
-                "Invalid config line in {}:{}",
-                path.display(),
-                line_number + 1
-            )));
-        };
-        let key = key.trim().to_string();
-        validate_key(path, &section, &key)?;
-        let mut value = value.trim().to_string();
-        if section == "check" && key == "commands" {
-            while bracket_balance(&value) > 0 {
-                let Some((_, next)) = lines.next() else {
-                    break;
-                };
-                value.push('\n');
-                value.push_str(next);
-            }
-            data.values.insert(
-                (section.clone(), key),
-                ConfigValue::Commands(parse_commands(&value)?),
-            );
-        } else if value == "true" || value == "false" {
-            data.values
-                .insert((section.clone(), key), ConfigValue::Bool(value == "true"));
-        } else {
-            data.values.insert(
-                (section.clone(), key),
-                ConfigValue::String(parse_string(&value)?),
-            );
-        }
-    }
-
-    let unknown = sections
-        .iter()
-        .filter(|section| !TOP_LEVEL_KEYS.contains(&section.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unknown.is_empty() {
-        return Err(NrError::message(format!(
-            "Unknown config section in {}: {}",
-            path.display(),
-            unknown.join(", ")
-        )));
-    }
-    Ok(data)
-}
-
-fn validate_section(path: &Path, section: &str) -> Result<()> {
-    if !TOP_LEVEL_KEYS.contains(&section) {
-        return Err(NrError::message(format!(
-            "Unknown config section in {}: {section}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_key(path: &Path, section: &str, key: &str) -> Result<()> {
-    let allowed = match section {
-        "target" => TARGET_KEYS,
-        "check" => CHECK_KEYS,
-        "publish" => PUBLISH_KEYS,
-        _ => return validate_section(path, section),
+fn reject_repo_flake(data: &Option<ConfigData>) -> Result<()> {
+    let Some(value) = data.as_ref().and_then(|data| data.target.flake.as_ref()) else {
+        return Ok(());
     };
-    if !allowed.contains(&key) {
-        return Err(NrError::message(format!(
-            "Unknown [{section}] key in {}: {key}",
-            path.display()
-        )));
+    if value.trim().is_empty() {
+        return Err(NrError::message("[target].flake cannot be empty."));
     }
-    Ok(())
+    Err(NrError::message(
+        ".nr.toml cannot set [target].flake; it already lives in the flake.",
+    ))
 }
 
-fn string_value(data: &Option<ConfigData>, section: &str, key: &str) -> Result<Option<String>> {
-    let Some(data) = data else {
+fn target_flake(data: &Option<ConfigData>) -> Result<Option<String>> {
+    non_empty_string(
+        data.as_ref().and_then(|data| data.target.flake.as_ref()),
+        "[target].flake",
+    )
+}
+
+fn target_host(data: &Option<ConfigData>) -> Result<Option<String>> {
+    non_empty_string(
+        data.as_ref().and_then(|data| data.target.host.as_ref()),
+        "[target].host",
+    )
+}
+
+fn publish_remote(data: &ConfigData) -> Result<Option<String>> {
+    non_empty_string(data.publish.remote.as_ref(), "[publish].remote")
+}
+
+fn non_empty_string(value: Option<&String>, label: &str) -> Result<Option<String>> {
+    let Some(value) = value else {
         return Ok(None);
     };
-    let Some(value) = data.values.get(&(section.to_string(), key.to_string())) else {
-        return Ok(None);
-    };
-    match value {
-        ConfigValue::String(value) if !value.trim().is_empty() => {
-            Ok(Some(value.trim().to_string()))
-        }
-        ConfigValue::String(_) => Err(NrError::message(format!(
-            "[{section}].{key} cannot be empty."
-        ))),
-        _ => Err(NrError::message(format!(
-            "[{section}].{key} must be a string."
-        ))),
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(NrError::message(format!("{label} cannot be empty.")));
     }
+    Ok(Some(trimmed.to_string()))
 }
 
-fn bool_value(data: &ConfigData, section: &str, key: &str) -> Result<Option<bool>> {
-    let Some(value) = data.values.get(&(section.to_string(), key.to_string())) else {
-        return Ok(None);
-    };
-    match value {
-        ConfigValue::Bool(value) => Ok(Some(*value)),
-        _ => Err(NrError::message(format!(
-            "[{section}].{key} must be true or false."
-        ))),
+fn merge_check_settings(mut base: CheckSettings, data: &ConfigData) -> CheckSettings {
+    if let Some(value) = data.check.flake {
+        base.flake = value;
     }
-}
-
-fn commands_value(data: &ConfigData) -> Result<Option<Vec<CheckCommand>>> {
-    let Some(value) = data
-        .values
-        .get(&("check".to_string(), "commands".to_string()))
-    else {
-        return Ok(None);
-    };
-    match value {
-        ConfigValue::Commands(commands) => Ok(Some(commands.clone())),
-        _ => Err(NrError::message(
-            "[check].commands must be a list of command arrays.",
-        )),
+    if let Some(value) = data.check.nixfmt {
+        base.nixfmt = value;
     }
-}
-
-fn merge_check_settings(mut base: CheckSettings, data: &ConfigData) -> Result<CheckSettings> {
-    for key in ["flake", "nixfmt", "statix", "cargo_fmt", "clippy"] {
-        if let Some(value) = bool_value(data, "check", key)? {
-            match key {
-                "flake" => base.flake = value,
-                "nixfmt" => base.nixfmt = value,
-                "statix" => base.statix = value,
-                "cargo_fmt" => base.cargo_fmt = value,
-                "clippy" => base.clippy = value,
-                _ => unreachable!(),
-            }
-        }
+    if let Some(value) = data.check.statix {
+        base.statix = value;
     }
-    if let Some(commands) = commands_value(data)? {
-        base.commands = commands;
+    if let Some(value) = data.check.cargo_fmt {
+        base.cargo_fmt = value;
     }
-    Ok(base)
+    if let Some(value) = data.check.clippy {
+        base.clippy = value;
+    }
+    if let Some(commands) = &data.check.commands {
+        base.commands = commands.clone();
+    }
+    base
 }
 
 fn merge_publish_settings(mut base: PublishSettings, data: &ConfigData) -> Result<PublishSettings> {
-    if let Some(remote) = string_value(&Some(data.clone()), "publish", "remote")? {
+    if let Some(remote) = publish_remote(data)? {
         base.remote = remote;
     }
     Ok(base)
-}
-
-fn parse_string(value: &str) -> Result<String> {
-    let value = value.trim();
-    if !(value.starts_with('"') && value.ends_with('"')) {
-        return Err(NrError::message(format!(
-            "Expected a quoted string, got {value}"
-        )));
-    }
-    unescape_string(&value[1..value.len() - 1])
-}
-
-fn parse_commands(value: &str) -> Result<Vec<CheckCommand>> {
-    let mut commands = Vec::new();
-    let mut index = 0;
-    let bytes = value.as_bytes();
-    while index < bytes.len() {
-        if bytes[index] != b'[' {
-            index += 1;
-            continue;
-        }
-        index += 1;
-        let mut command = Vec::new();
-        loop {
-            while index < bytes.len() && matches!(bytes[index], b' ' | b'\n' | b'\t' | b'\r' | b',')
-            {
-                index += 1;
-            }
-            if index >= bytes.len() || bytes[index] == b']' {
-                break;
-            }
-            if bytes[index] != b'"' {
-                index += 1;
-                continue;
-            }
-            let (text, next) = parse_quoted_at(value, index)?;
-            command.push(text);
-            index = next;
-        }
-        if !command.is_empty() {
-            commands.push(command);
-        }
-        index += 1;
-    }
-    Ok(commands)
-}
-
-fn parse_quoted_at(value: &str, start: usize) -> Result<(String, usize)> {
-    let mut escaped = false;
-    let mut output = String::new();
-    for (offset, character) in value[start + 1..].char_indices() {
-        if escaped {
-            output.push(match character {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                '"' => '"',
-                '\\' => '\\',
-                other => other,
-            });
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '"' {
-            return Ok((output, start + 1 + offset + 1));
-        } else {
-            output.push(character);
-        }
-    }
-    Err(NrError::message("Unterminated string in commands array."))
-}
-
-fn unescape_string(value: &str) -> Result<String> {
-    parse_quoted_at(&format!("\"{value}\""), 0).map(|(value, _)| value)
-}
-
-fn bracket_balance(value: &str) -> i32 {
-    let mut balance = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for character in value.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if in_string {
-            if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            '"' => in_string = true,
-            '[' => balance += 1,
-            ']' => balance -= 1,
-            _ => {}
-        }
-    }
-    balance
-}
-
-fn strip_comment(line: &str) -> &str {
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if in_string {
-            if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-        } else if character == '"' {
-            in_string = true;
-        } else if character == '#' {
-            return &line[..index];
-        }
-    }
-    line
 }
 
 fn resolve_config_path(

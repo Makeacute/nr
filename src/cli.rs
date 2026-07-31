@@ -2,110 +2,164 @@ use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+
 use crate::VERSION;
 use crate::backend::BackendOptions;
 use crate::config::{ConfigInput, load_config};
-use crate::errors::{NrError, Result};
+use crate::errors::{IoContext, NrError, Result};
 use crate::ui::OutputMode;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parser)]
+#[command(
+    name = "nr",
+    version = VERSION,
+    about = "Build, switch, update, check, and publish a NixOS flake.",
+    disable_help_subcommand = true
+)]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH[#HOST]",
+        help = "Select a flake and optional host"
+    )]
     pub flake: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "HOST",
+        help = "Override the NixOS configuration name"
+    )]
     pub host: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "auto",
+        help = "Select command output mode"
+    )]
     pub ui: OutputMode,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Capture the full backend log at PATH"
+    )]
     pub log_file: Option<PathBuf>,
+    #[arg(
+        short = 'v',
+        long,
+        global = true,
+        action = ArgAction::Count,
+        help = "Increase backend verbosity"
+    )]
     pub verbose: u8,
+    #[arg(
+        long,
+        global = true,
+        help = "Alias lifecycle commands to preview-style behavior"
+    )]
     pub dry: bool,
+    #[arg(long, global = true, help = "Ask before activation")]
     pub ask: bool,
+    #[arg(long, global = true, help = "Forward offline mode to Nix")]
     pub offline: bool,
+    #[arg(long, global = true, help = "Forward Nix traces")]
     pub show_trace: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Build or activate a NixOS specialisation"
+    )]
     pub specialisation: Option<String>,
+    #[command(subcommand)]
     pub command: Option<NrCommand>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum NrCommand {
+    #[command(about = "Build the selected host without activating it")]
     Build(Passthrough),
+    #[command(about = "Build and activate the selected host")]
     Switch(Passthrough),
+    #[command(about = "Build and activate until the next reboot")]
     Test(Passthrough),
+    #[command(about = "Build and make the generation the next boot default")]
     Boot(Passthrough),
+    #[command(about = "Build, diff, and dry-activate without mutating")]
     Preview(Passthrough),
+    #[command(about = "Update flake.lock or selected flake inputs")]
     Update(UpdateArgs),
+    #[command(about = "Roll back to the previous generation")]
     Rollback(Passthrough),
+    #[command(about = "Show NixOS generations")]
     Generations(GenerationsArgs),
+    #[command(about = "Review, commit, and optionally push")]
     Publish(PublishArgs),
+    #[command(about = "Run configured checks")]
     Check(CheckArgs),
+    #[command(about = "Show target, config, dependency, and Git diagnostics")]
     Doctor,
+    #[command(about = "Show the complete terminal cheat sheet")]
     Cheat,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct Passthrough {
+    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
     pub backend_args: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct UpdateArgs {
+    #[arg(value_name = "INPUT")]
     pub inputs: Vec<String>,
+    #[arg(long)]
     pub switch: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct GenerationsArgs {
+    #[arg(long, value_name = "PROFILE")]
     pub profile: Option<String>,
+    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
     pub backend_args: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum PublishMode {
     Single,
     PerFile,
 }
 
-impl PublishMode {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "single" => Some(Self::Single),
-            "per-file" => Some(Self::PerFile),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct PublishArgs {
+    #[arg(short = 'm', long)]
     pub message: Option<String>,
+    #[arg(long)]
     pub push: bool,
+    #[arg(long, value_enum)]
     pub mode: Option<PublishMode>,
+    #[arg(long, value_name = "REMOTE")]
     pub remote: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Args)]
 pub struct CheckArgs {
+    #[arg(long)]
     pub all: bool,
+    #[arg(long)]
     pub nixfmt: bool,
+    #[arg(long)]
     pub statix: bool,
+    #[arg(long = "cargo-fmt")]
     pub cargo_fmt: bool,
+    #[arg(long)]
     pub clippy: bool,
+    #[arg(long = "no-flake")]
     pub no_flake: bool,
-}
-
-impl Default for Cli {
-    fn default() -> Self {
-        Self {
-            flake: None,
-            host: None,
-            ui: OutputMode::Auto,
-            log_file: None,
-            verbose: 0,
-            dry: false,
-            ask: false,
-            offline: false,
-            show_trace: false,
-            specialisation: None,
-            command: None,
-        }
-    }
 }
 
 impl Cli {
@@ -130,13 +184,9 @@ impl Cli {
     pub fn parse_from<I, S>(args: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
-        S: Into<OsString>,
+        S: Into<OsString> + Clone,
     {
-        let values = args
-            .into_iter()
-            .map(|value| value.into().to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        parse_values(&values)
+        <Self as Parser>::try_parse_from(args).map_err(|error| NrError::message(error.to_string()))
     }
 }
 
@@ -151,19 +201,18 @@ pub fn main() -> i32 {
 }
 
 pub fn run() -> Result<i32> {
-    let args = env::args().collect::<Vec<_>>();
-    if args.iter().any(|arg| arg == "--version") {
-        println!("nr {VERSION}");
-        return Ok(0);
-    }
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_help();
-        return Ok(0);
-    }
-
-    let cli = Cli::parse_from(args)?;
+    let cli = match Cli::try_parse_from(env::args_os()) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = error.exit_code();
+            error
+                .print()
+                .with_context("failed to print command-line error")?;
+            return Ok(code);
+        }
+    };
     let Some(command) = &cli.command else {
-        print_help();
+        print_help()?;
         return Ok(0);
     };
 
@@ -201,278 +250,11 @@ pub fn run() -> Result<i32> {
     }
 }
 
-fn parse_values(values: &[String]) -> Result<Cli> {
-    let mut cli = Cli::default();
-    let mut index = 1;
-    while index < values.len() {
-        if parse_global(values, &mut index, &mut cli)? {
-            continue;
-        }
-        let command = values[index].as_str();
-        index += 1;
-        cli.command = Some(match command {
-            "build" => NrCommand::Build(parse_passthrough(values, &mut index, &mut cli)?),
-            "switch" => NrCommand::Switch(parse_passthrough(values, &mut index, &mut cli)?),
-            "test" => NrCommand::Test(parse_passthrough(values, &mut index, &mut cli)?),
-            "boot" => NrCommand::Boot(parse_passthrough(values, &mut index, &mut cli)?),
-            "preview" => NrCommand::Preview(parse_passthrough(values, &mut index, &mut cli)?),
-            "update" => NrCommand::Update(parse_update(values, &mut index, &mut cli)?),
-            "rollback" => NrCommand::Rollback(parse_passthrough(values, &mut index, &mut cli)?),
-            "generations" => {
-                NrCommand::Generations(parse_generations(values, &mut index, &mut cli)?)
-            }
-            "publish" => NrCommand::Publish(parse_publish(values, &mut index, &mut cli)?),
-            "check" => NrCommand::Check(parse_check(values, &mut index, &mut cli)?),
-            "doctor" => NrCommand::Doctor,
-            "cheat" => NrCommand::Cheat,
-            other => return Err(NrError::message(format!("Unknown command: {other}"))),
-        });
-        if matches!(cli.command, Some(NrCommand::Doctor | NrCommand::Cheat)) {
-            while index < values.len() {
-                if !parse_global(values, &mut index, &mut cli)? {
-                    return Err(NrError::message(format!(
-                        "Unexpected argument: {}",
-                        values[index]
-                    )));
-                }
-            }
-        }
-        break;
-    }
-    Ok(cli)
-}
-
-fn parse_global(values: &[String], index: &mut usize, cli: &mut Cli) -> Result<bool> {
-    let Some(arg) = values.get(*index) else {
-        return Ok(false);
-    };
-    if let Some(value) = arg.strip_prefix("--flake=") {
-        cli.flake = Some(value.to_string());
-        *index += 1;
-        return Ok(true);
-    }
-    if let Some(value) = arg.strip_prefix("--host=") {
-        cli.host = Some(value.to_string());
-        *index += 1;
-        return Ok(true);
-    }
-    if let Some(value) = arg.strip_prefix("--ui=") {
-        cli.ui = parse_ui(value)?;
-        *index += 1;
-        return Ok(true);
-    }
-    if let Some(value) = arg.strip_prefix("--log-file=") {
-        cli.log_file = Some(PathBuf::from(value));
-        *index += 1;
-        return Ok(true);
-    }
-    if let Some(value) = arg.strip_prefix("--specialisation=") {
-        cli.specialisation = Some(value.to_string());
-        *index += 1;
-        return Ok(true);
-    }
-
-    match arg.as_str() {
-        "--flake" => {
-            cli.flake = Some(take_value(values, index, "--flake")?);
-            Ok(true)
-        }
-        "--host" => {
-            cli.host = Some(take_value(values, index, "--host")?);
-            Ok(true)
-        }
-        "--ui" => {
-            let value = take_value(values, index, "--ui")?;
-            cli.ui = parse_ui(&value)?;
-            Ok(true)
-        }
-        "--log-file" => {
-            cli.log_file = Some(PathBuf::from(take_value(values, index, "--log-file")?));
-            Ok(true)
-        }
-        "--specialisation" => {
-            cli.specialisation = Some(take_value(values, index, "--specialisation")?);
-            Ok(true)
-        }
-        "--dry" => {
-            cli.dry = true;
-            *index += 1;
-            Ok(true)
-        }
-        "--ask" => {
-            cli.ask = true;
-            *index += 1;
-            Ok(true)
-        }
-        "--offline" => {
-            cli.offline = true;
-            *index += 1;
-            Ok(true)
-        }
-        "--show-trace" => {
-            cli.show_trace = true;
-            *index += 1;
-            Ok(true)
-        }
-        "-v" | "--verbose" => {
-            cli.verbose = cli.verbose.saturating_add(1);
-            *index += 1;
-            Ok(true)
-        }
-        value
-            if value.starts_with("-v")
-                && value.chars().skip(1).all(|character| character == 'v') =>
-        {
-            cli.verbose = cli.verbose.saturating_add((value.len() - 1) as u8);
-            *index += 1;
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
-}
-
-fn parse_passthrough(values: &[String], index: &mut usize, cli: &mut Cli) -> Result<Passthrough> {
-    let mut backend_args = Vec::new();
-    while *index < values.len() {
-        if values[*index] == "--" {
-            backend_args.extend(values[*index + 1..].iter().cloned());
-            *index = values.len();
-            break;
-        }
-        if parse_global(values, index, cli)? {
-            continue;
-        }
-        return Err(NrError::message(format!(
-            "Unexpected argument: {}",
-            values[*index]
-        )));
-    }
-    Ok(Passthrough { backend_args })
-}
-
-fn parse_update(values: &[String], index: &mut usize, cli: &mut Cli) -> Result<UpdateArgs> {
-    let mut args = UpdateArgs::default();
-    while *index < values.len() {
-        if parse_global(values, index, cli)? {
-            continue;
-        }
-        if values[*index] == "--switch" {
-            args.switch = true;
-            *index += 1;
-        } else {
-            args.inputs.push(values[*index].clone());
-            *index += 1;
-        }
-    }
-    Ok(args)
-}
-
-fn parse_generations(
-    values: &[String],
-    index: &mut usize,
-    cli: &mut Cli,
-) -> Result<GenerationsArgs> {
-    let mut args = GenerationsArgs::default();
-    while *index < values.len() {
-        if values[*index] == "--" {
-            args.backend_args
-                .extend(values[*index + 1..].iter().cloned());
-            *index = values.len();
-            break;
-        }
-        if parse_global(values, index, cli)? {
-            continue;
-        }
-        if values[*index] == "--profile" {
-            args.profile = Some(take_value(values, index, "--profile")?);
-        } else if let Some(value) = values[*index].strip_prefix("--profile=") {
-            args.profile = Some(value.to_string());
-            *index += 1;
-        } else {
-            return Err(NrError::message(format!(
-                "Unexpected argument: {}",
-                values[*index]
-            )));
-        }
-    }
-    Ok(args)
-}
-
-fn parse_publish(values: &[String], index: &mut usize, cli: &mut Cli) -> Result<PublishArgs> {
-    let mut args = PublishArgs::default();
-    while *index < values.len() {
-        if parse_global(values, index, cli)? {
-            continue;
-        }
-        if let Some(value) = values[*index].strip_prefix("--mode=") {
-            args.mode = Some(parse_publish_mode(value)?);
-            *index += 1;
-        } else if let Some(value) = values[*index].strip_prefix("--remote=") {
-            args.remote = Some(value.to_string());
-            *index += 1;
-        } else {
-            match values[*index].as_str() {
-                "-m" | "--message" => args.message = Some(take_value(values, index, "--message")?),
-                "--push" => {
-                    args.push = true;
-                    *index += 1;
-                }
-                "--mode" => {
-                    args.mode = Some(parse_publish_mode(&take_value(values, index, "--mode")?)?)
-                }
-                "--remote" => args.remote = Some(take_value(values, index, "--remote")?),
-                other => return Err(NrError::message(format!("Unexpected argument: {other}"))),
-            }
-        }
-    }
-    Ok(args)
-}
-
-fn parse_check(values: &[String], index: &mut usize, cli: &mut Cli) -> Result<CheckArgs> {
-    let mut args = CheckArgs::default();
-    while *index < values.len() {
-        if parse_global(values, index, cli)? {
-            continue;
-        }
-        match values[*index].as_str() {
-            "--all" => args.all = true,
-            "--nixfmt" => args.nixfmt = true,
-            "--statix" => args.statix = true,
-            "--cargo-fmt" => args.cargo_fmt = true,
-            "--clippy" => args.clippy = true,
-            "--no-flake" => args.no_flake = true,
-            other => return Err(NrError::message(format!("Unexpected argument: {other}"))),
-        }
-        *index += 1;
-    }
-    Ok(args)
-}
-
-fn take_value(values: &[String], index: &mut usize, flag: &str) -> Result<String> {
-    let value_index = *index + 1;
-    let Some(value) = values.get(value_index) else {
-        return Err(NrError::message(format!("{flag} requires a value.")));
-    };
-    *index += 2;
-    Ok(value.clone())
-}
-
-fn parse_ui(value: &str) -> Result<OutputMode> {
-    OutputMode::parse(value).ok_or_else(|| {
-        NrError::message("Invalid --ui value. Expected auto, rich, plain, raw, or json.")
-    })
-}
-
-fn parse_publish_mode(value: &str) -> Result<PublishMode> {
-    PublishMode::parse(value)
-        .ok_or_else(|| NrError::message("Invalid --mode value. Expected single or per-file."))
-}
-
-fn print_help() {
-    println!(
-        "Build, switch, update, check, and publish a NixOS flake.\n\n\
-Usage: nr [OPTIONS] <COMMAND> [ARGS]\n\n\
-Commands:\n  build\n  switch\n  test\n  boot\n  preview\n  update\n  rollback\n  generations\n  publish\n  check\n  doctor\n  cheat\n\n\
-Options:\n  --flake PATH[#HOST]\n  --host HOST\n  --ui auto|rich|plain|raw|json\n  --log-file PATH\n  -v, --verbose\n  --dry\n  --ask\n  --offline\n  --show-trace\n  --specialisation NAME\n  --version\n  -h, --help"
-    );
+fn print_help() -> Result<()> {
+    let mut command = Cli::command();
+    command
+        .print_help()
+        .with_context("failed to print command help")?;
+    println!();
+    Ok(())
 }

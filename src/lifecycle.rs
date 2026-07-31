@@ -1,7 +1,5 @@
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend;
 use crate::cli::{Cli, UpdateArgs};
@@ -35,18 +33,24 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
     };
     renderer.start(&header);
 
-    let temp_dir;
+    let _temp_dir;
     let build_cwd = if action == "build" && !preview {
+        _temp_dir = None;
         env::current_dir().map_err(|error| NrError::Io {
             context: "failed to determine current directory".to_string(),
             source: error,
         })?
     } else {
-        temp_dir = TempBuildDir::new().map_err(|error| NrError::Io {
-            context: "failed to create build directory".to_string(),
-            source: error,
-        })?;
-        temp_dir.path().to_path_buf()
+        let directory = tempfile::Builder::new()
+            .prefix("nr-build-")
+            .tempdir()
+            .map_err(|error| NrError::Io {
+                context: "failed to create build directory".to_string(),
+                source: error,
+            })?;
+        let path = directory.path().to_path_buf();
+        _temp_dir = Some(directory);
+        path
     };
 
     renderer.phase("evaluating/building");
@@ -181,45 +185,6 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
     renderer.finish(&report);
     log.flush()?;
     Ok(0)
-}
-
-struct TempBuildDir {
-    path: PathBuf,
-}
-
-impl TempBuildDir {
-    fn new() -> std::io::Result<Self> {
-        let mut attempts = 0u32;
-        loop {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = env::temp_dir().join(format!(
-                "nr-build-{}-{nanos}-{attempts}",
-                std::process::id()
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 32 =>
-                {
-                    attempts += 1;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempBuildDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
 
 pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32> {

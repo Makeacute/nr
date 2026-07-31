@@ -39,7 +39,10 @@ host = "user-host"
 
 [check]
 nixfmt = true
-commands = [["echo", "ok"]]
+commands = [
+  ["echo", "[ok]"],
+  ["sh", "-c", "printf '[done]'"],
+]
 
 [publish]
 remote = "upstream"
@@ -98,7 +101,14 @@ statix = true
         CheckSettings {
             nixfmt: true,
             statix: true,
-            commands: vec![vec!["echo".to_string(), "ok".to_string()]],
+            commands: vec![
+                vec!["echo".to_string(), "[ok]".to_string()],
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf '[done]'".to_string(),
+                ],
+            ],
             ..CheckSettings::default()
         }
     );
@@ -111,4 +121,39 @@ fn validate_flake_path_requires_flake_file() {
     assert!(validate_flake_path(temp.path()).is_err());
     support::make_flake(temp.path());
     validate_flake_path(temp.path()).unwrap();
+}
+
+#[test]
+fn config_rejects_unknown_keys() {
+    let temp = support::TestDir::new();
+    let flake = support::make_flake(&temp.path().join("flake"));
+    let xdg = temp.path().join("xdg");
+    fs::create_dir_all(xdg.join("nr")).unwrap();
+    fs::write(
+        xdg.join("nr/config.toml"),
+        format!(
+            r#"
+[target]
+flake = "{}"
+
+[check]
+typo = true
+"#,
+            flake.display()
+        ),
+    )
+    .unwrap();
+
+    let error = load_config(ConfigInput {
+        cwd: Some(temp.path().to_path_buf()),
+        environ: Some(vec![(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.display().to_string(),
+        )]),
+        ..ConfigInput::default()
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("unknown field"));
 }

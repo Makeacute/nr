@@ -1,14 +1,19 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use clap::ValueEnum;
+use serde_json::json;
+use terminal_size::{Width, terminal_size};
+
 use crate::config::FlakeTarget;
-use crate::events::{Activity, BuildState, NixEvent};
+use crate::events::{Activity, ActivityStatus, BuildState, NixEvent};
 use crate::git::GitSummary;
 use crate::impact::{ActivationImpact, ClosureDiff, GenerationInfo};
 use crate::process::{StreamLine, StreamSource};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputMode {
     Auto,
     Rich,
@@ -261,30 +266,38 @@ fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
     ));
     lines.push("system closure".to_string());
 
-    let active = state.running.values().collect::<Vec<_>>();
-    let shown = active.len().min(6);
-    for (index, activity) in active.iter().take(shown).enumerate() {
-        let has_more = active.len() > shown;
-        let is_last = index + 1 == shown && !has_more;
-        let connector = if is_last { "`--" } else { "|--" };
-        lines.push(activity_line(connector, activity));
-        if index < 3
-            && let Some(why) = state.why_building(activity)
-        {
-            let prefix = if is_last { "    " } else { "|   " };
-            lines.push(format!("{prefix}why: {}", compact_activity_text(&why)));
-        }
-    }
-
-    if active.is_empty() {
+    let lineage = state.active_lineage_ids();
+    if lineage.is_empty() {
         lines.push("`-- waiting for Nix activity".to_string());
-    } else if active.len() > shown {
-        lines.push(format!("`-- ... {} more active", active.len() - shown));
+    } else {
+        let children = lineage_children(state, &lineage);
+        let roots = children.get(&None).cloned().unwrap_or_default();
+        let mut graph = GraphRender {
+            state,
+            children: &children,
+            rendered: 0,
+            max_nodes: 10,
+            lines: &mut lines,
+        };
+        for (index, id) in roots.iter().enumerate() {
+            if graph.rendered >= graph.max_nodes {
+                break;
+            }
+            graph.push_node(*id, "", index + 1 == roots.len());
+        }
+        let rendered = graph.rendered;
+        if lineage.len() > rendered {
+            lines.push(format!(
+                "`-- ... {} more graph nodes",
+                lineage.len() - rendered
+            ));
+        }
     }
 
     if let Some(activity) = state.slowest_active() {
         lines.push(format!(
-            "slowest: {} [{}]",
+            "slowest: {} {} [{}]",
+            format_duration(activity.started_at.elapsed()),
             compact_activity_text(&activity.text),
             activity.category.label()
         ));
@@ -302,13 +315,79 @@ fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn activity_line(connector: &str, activity: &Activity) -> String {
+fn lineage_children(
+    state: &BuildState,
+    lineage: &BTreeSet<u64>,
+) -> BTreeMap<Option<u64>, Vec<u64>> {
+    let mut children: BTreeMap<Option<u64>, Vec<u64>> = BTreeMap::new();
+    for id in lineage {
+        let Some(activity) = state.nodes.get(id) else {
+            continue;
+        };
+        let parent = activity.parent.filter(|parent| lineage.contains(parent));
+        children.entry(parent).or_default().push(*id);
+    }
+    children
+}
+
+struct GraphRender<'a> {
+    state: &'a BuildState,
+    children: &'a BTreeMap<Option<u64>, Vec<u64>>,
+    rendered: usize,
+    max_nodes: usize,
+    lines: &'a mut Vec<String>,
+}
+
+impl GraphRender<'_> {
+    fn push_node(&mut self, id: u64, prefix: &str, is_last: bool) {
+        if self.rendered >= self.max_nodes {
+            return;
+        }
+        let Some(activity) = self.state.nodes.get(&id) else {
+            return;
+        };
+        let connector = if is_last { "`--" } else { "|--" };
+        self.lines.push(format!(
+            "{prefix}{connector} {}",
+            activity_summary(activity)
+        ));
+        self.rendered += 1;
+
+        let Some(child_ids) = self.children.get(&Some(id)) else {
+            return;
+        };
+        let next_prefix = format!("{prefix}{}", if is_last { "    " } else { "|   " });
+        for (index, child_id) in child_ids.iter().enumerate() {
+            if self.rendered >= self.max_nodes {
+                return;
+            }
+            self.push_node(*child_id, &next_prefix, index + 1 == child_ids.len());
+        }
+    }
+}
+
+fn activity_summary(activity: &Activity) -> String {
+    let mut details = vec![
+        activity.category.label().to_string(),
+        provenance(activity).to_string(),
+    ];
+    if activity.status == ActivityStatus::Running {
+        details.push(format_duration(activity.started_at.elapsed()));
+    }
     format!(
-        "{connector} {} {} [{}]",
-        activity_kind(activity),
+        "{} {} [{}]",
+        activity_status(activity),
         compact_activity_text(&activity.text),
-        activity.category.label()
+        details.join(" ")
     )
+}
+
+fn activity_status(activity: &Activity) -> &'static str {
+    match activity.status {
+        ActivityStatus::Running => activity_kind(activity),
+        ActivityStatus::Completed => "done",
+        ActivityStatus::Failed => "fail",
+    }
 }
 
 fn activity_kind(activity: &Activity) -> &'static str {
@@ -324,12 +403,47 @@ fn activity_kind(activity: &Activity) -> &'static str {
     }
 }
 
+fn provenance(activity: &Activity) -> &'static str {
+    if activity.substitute {
+        "cache"
+    } else if activity.source_build {
+        "source"
+    } else {
+        "event"
+    }
+}
+
 fn terminal_width() -> usize {
+    if let Some((Width(width), _)) = terminal_size() {
+        let width = usize::from(width);
+        if width >= 40 {
+            return width;
+        }
+    }
     std::env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|width| *width >= 40)
         .unwrap_or(100)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{millis}ms");
+    }
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m{seconds:02}s");
+    }
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    format!("{hours}h{minutes:02}m")
 }
 
 fn compact_activity_text(text: &str) -> String {
@@ -391,7 +505,12 @@ fn truncate_line(line: &str, max_width: usize) -> String {
 fn should_print_backend_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     let lower = trimmed.to_lowercase();
-    if lower.starts_with("debug:") || lower.starts_with("trace:") {
+    if lower.starts_with("debug:")
+        || lower.starts_with("trace:")
+        || lower.contains("nixos_rebuild.process: captured output")
+        || lower.contains("nixos-rebuild.process: captured output")
+        || lower.contains("captured output with stdout=")
+    {
         return false;
     }
     lower.starts_with("warning:")
@@ -488,98 +607,60 @@ fn print_units(label: &str, values: &[String]) {
 }
 
 fn report_json(report: &RebuildReport) -> String {
-    let mut fields = Vec::new();
-    fields.push(json_field("command", &report.command));
-    fields.push(json_field("target", &report.target.reference()));
-    fields.push(json_field("result", &report.result));
-    if let Some(path) = &report.store_path {
-        fields.push(json_field("store_path", &path.display().to_string()));
-    }
-    fields.push(json_number_or_null(
-        "current_generation",
-        report.current.generation,
-    ));
-    fields.push(json_number_or_null("new_generation", report.new_generation));
-    fields.push(json_field("reboot", &report.reboot));
-    fields.push(json_field("rollback", &report.rollback));
-    fields.push(json_field(
-        "log_path",
-        &report.log_path.display().to_string(),
-    ));
-    fields.push(format!(
-        "\"build\":{{\"completed\":{},\"failed\":{},\"running\":{},\"downloads\":{},\"source_builds\":{},\"binary_substitutes\":{},\"parser_fallback\":{}}}",
-        report.build.completed,
-        report.build.failed,
-        report.build.running.len(),
-        report.build.downloads,
-        report.build.source_builds,
-        report.build.binary_substitutes,
-        report.build.parser_fallback
-    ));
-    if let Some(diff) = &report.diff {
-        fields.push(format!(
-            "\"diff\":{{\"additions\":{},\"removals\":{},\"upgrades\":{},\"downgrades\":{},\"important\":{}}}",
-            diff.additions.len(),
-            diff.removals.len(),
-            diff.upgrades.len(),
-            diff.downgrades.len(),
-            json_string_array(&diff.important)
-        ));
-    }
-    if let Some(activation) = &report.activation {
-        fields.push(format!(
-            "\"activation\":{{\"stopped\":{},\"started\":{},\"restarted\":{},\"reloaded\":{},\"skipped\":{},\"failed\":{}}}",
-            json_string_array(&activation.stopped),
-            json_string_array(&activation.started),
-            json_string_array(&activation.restarted),
-            json_string_array(&activation.reloaded),
-            json_string_array(&activation.skipped),
-            json_string_array(&activation.failed)
-        ));
-    }
-    format!("{{{}}}", fields.join(","))
-}
+    let store_path = report
+        .store_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let diff = report.diff.as_ref().map(|diff| {
+        json!({
+            "additions": diff.additions.len(),
+            "removals": diff.removals.len(),
+            "upgrades": diff.upgrades.len(),
+            "downgrades": diff.downgrades.len(),
+            "important": diff.important,
+        })
+    });
+    let activation = report.activation.as_ref().map(|activation| {
+        json!({
+            "stopped": activation.stopped,
+            "started": activation.started,
+            "restarted": activation.restarted,
+            "reloaded": activation.reloaded,
+            "skipped": activation.skipped,
+            "failed": activation.failed,
+        })
+    });
 
-fn json_field(key: &str, value: &str) -> String {
-    format!("\"{key}\":\"{}\"", json_escape(value))
-}
-
-fn json_number_or_null(key: &str, value: Option<u64>) -> String {
-    match value {
-        Some(value) => format!("\"{key}\":{value}"),
-        None => format!("\"{key}\":null"),
-    }
-}
-
-fn json_string_array(values: &[String]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|value| format!("\"{}\"", json_escape(value)))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn json_escape(value: &str) -> String {
-    let mut output = String::new();
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            other => output.push(other),
-        }
-    }
-    output
+    json!({
+        "command": report.command,
+        "target": report.target.reference(),
+        "result": report.result,
+        "store_path": store_path,
+        "current_generation": report.current.generation,
+        "new_generation": report.new_generation,
+        "reboot": report.reboot,
+        "rollback": report.rollback,
+        "log_path": report.log_path.display().to_string(),
+        "build": {
+            "completed": report.build.completed,
+            "failed": report.build.failed,
+            "running": report.build.running.len(),
+            "downloads": report.build.downloads,
+            "source_builds": report.build.source_builds,
+            "binary_substitutes": report.build.binary_substitutes,
+            "parser_fallback": report.build.parser_fallback,
+        },
+        "diff": diff,
+        "activation": activation,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{Activity, BuildCategory, BuildState};
+    use std::time::{Duration, Instant};
+
+    use crate::events::{Activity, ActivityStatus, BuildCategory, BuildState};
 
     use super::{build_graph_lines, should_print_backend_line, truncate_line};
 
@@ -593,35 +674,40 @@ mod tests {
             binary_substitutes: 1,
             ..BuildState::default()
         };
-        state.running.insert(
-            1,
-            Activity {
-                id: 1,
-                parent: None,
-                text: "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-linux-with-a-very-long-name.drv'"
-                    .to_string(),
-                category: BuildCategory::KernelBoot,
-                source_build: true,
-                substitute: false,
-            },
-        );
-        state.running.insert(
-            2,
-            Activity {
-                id: 2,
-                parent: Some(1),
-                text: "evaluating derivation 'git+file:///etc/nixos#nixosConfigurations.\"nixos\".config.system.build.toplevel'"
-                    .to_string(),
-                category: BuildCategory::Unknown,
-                source_build: false,
-                substitute: false,
-            },
-        );
+        let now = Instant::now();
+        let parent = Activity {
+            id: 1,
+            parent: None,
+            text: "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-linux-with-a-very-long-name.drv'"
+                .to_string(),
+            category: BuildCategory::KernelBoot,
+            source_build: true,
+            substitute: false,
+            status: ActivityStatus::Completed,
+            started_at: now - Duration::from_secs(20),
+        };
+        let child = Activity {
+            id: 2,
+            parent: Some(1),
+            text: "evaluating derivation 'git+file:///etc/nixos#nixosConfigurations.\"nixos\".config.system.build.toplevel'"
+                .to_string(),
+            category: BuildCategory::Other,
+            source_build: false,
+            substitute: false,
+            status: ActivityStatus::Running,
+            started_at: now - Duration::from_secs(5),
+        };
+        state.nodes.insert(parent.id, parent);
+        state.nodes.insert(child.id, child.clone());
+        state.running.insert(child.id, child);
 
         let lines = build_graph_lines(&state, 64);
 
         assert!(lines.iter().any(|line| line.contains("build graph")));
         assert!(lines.iter().any(|line| line.contains("system closure")));
+        assert!(lines.iter().any(|line| line.contains("done")));
+        assert!(lines.iter().any(|line| line.contains("eval")));
+        assert!(lines.iter().any(|line| line.starts_with("    `--")));
         assert!(lines.iter().all(|line| line.chars().count() <= 64));
     }
 
@@ -637,6 +723,9 @@ mod tests {
     fn backend_filter_skips_wrapped_debug_errors() {
         assert!(!should_print_backend_line(
             "debug: nixos_rebuild.process: captured output stderr=\"error: noisy\""
+        ));
+        assert!(!should_print_backend_line(
+            "nixos_rebuild.process: captured output with stdout='', stderr=\"error: noisy\""
         ));
         assert!(should_print_backend_line("error: real failure"));
         assert!(should_print_backend_line("warning: real warning"));

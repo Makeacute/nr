@@ -1,4 +1,8 @@
-use nr::events::{BuildCategory, BuildState, ParsedLine, parse_line};
+use std::time::{Duration, Instant};
+
+use nr::events::{
+    Activity, ActivityStatus, BuildCategory, BuildState, ParsedLine, categorize, parse_line,
+};
 use nr::impact::{parse_activation_impact, parse_closure_diff};
 
 #[test]
@@ -21,6 +25,50 @@ fn parses_internal_json_without_failing_unknown_events() {
     };
     state.ingest(&event);
     assert_eq!(state.unknown_events, 1);
+}
+
+#[test]
+fn categorizes_modern_wayland_desktop_stack() {
+    assert_eq!(categorize("building niri"), BuildCategory::DesktopStack);
+    assert_eq!(
+        categorize("building quickshell"),
+        BuildCategory::DesktopStack
+    );
+    assert_eq!(categorize("building hyprland"), BuildCategory::DesktopStack);
+    assert_eq!(
+        categorize("building something-random"),
+        BuildCategory::Other
+    );
+}
+
+#[test]
+fn slowest_active_uses_elapsed_time() {
+    let now = Instant::now();
+    let mut state = BuildState::default();
+    let newer = Activity {
+        id: 1,
+        parent: None,
+        text: "building newer".to_string(),
+        category: BuildCategory::Other,
+        source_build: true,
+        substitute: false,
+        status: ActivityStatus::Running,
+        started_at: now - Duration::from_secs(1),
+    };
+    let older = Activity {
+        id: 2,
+        parent: None,
+        text: "building older".to_string(),
+        category: BuildCategory::Other,
+        source_build: true,
+        substitute: false,
+        status: ActivityStatus::Running,
+        started_at: now - Duration::from_secs(10),
+    };
+    state.running.insert(newer.id, newer);
+    state.running.insert(older.id, older);
+
+    assert_eq!(state.slowest_active().map(|activity| activity.id), Some(2));
 }
 
 #[test]
