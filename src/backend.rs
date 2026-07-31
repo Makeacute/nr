@@ -100,6 +100,14 @@ pub fn nix_store_diff_closures_command(
     CommandSpec::new("nix").args(args)
 }
 
+pub fn nix_store_query_graph_command(path: &str) -> CommandSpec {
+    CommandSpec::new("nix-store").args([
+        "--query".to_string(),
+        "--graph".to_string(),
+        path.to_string(),
+    ])
+}
+
 pub fn nix_flake_update_command(
     target: &FlakeTarget,
     inputs: &[String],

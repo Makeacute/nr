@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use nr::events::{
-    Activity, ActivityStatus, BuildCategory, BuildState, ParsedLine, categorize, parse_line,
+    Activity, ActivityStatus, BuildCategory, BuildState, ParsedLine, categorize,
+    extract_derivation_paths, parse_line,
 };
 use nr::impact::{parse_activation_impact, parse_closure_diff};
 
@@ -49,6 +50,7 @@ fn slowest_active_uses_elapsed_time() {
         id: 1,
         parent: None,
         text: "building newer".to_string(),
+        drv_path: Some("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-newer.drv".to_string()),
         category: BuildCategory::Other,
         source_build: true,
         substitute: false,
@@ -59,6 +61,7 @@ fn slowest_active_uses_elapsed_time() {
         id: 2,
         parent: None,
         text: "building older".to_string(),
+        drv_path: Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-older.drv".to_string()),
         category: BuildCategory::Other,
         source_build: true,
         substitute: false,
@@ -69,6 +72,49 @@ fn slowest_active_uses_elapsed_time() {
     state.running.insert(older.id, older);
 
     assert_eq!(state.slowest_active().map(|activity| activity.id), Some(2));
+}
+
+#[test]
+fn extracts_derivation_paths_from_plain_nix_output() {
+    let paths = extract_derivation_paths(
+        "  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-host.drv",
+    );
+
+    assert_eq!(
+        paths,
+        vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-host.drv".to_string()]
+    );
+}
+
+#[test]
+fn dependency_graph_finds_path_from_system_derivation_to_active_drv() {
+    let mut state = BuildState::default();
+    state.note_derivation_paths_from_text(
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-host.drv",
+    );
+    state.note_derivation_graph(
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-host.drv",
+        r#"
+digraph G {
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-host.drv" [label = "nixos-system-host"];
+"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-etc.drv" [label = "etc"];
+"cccccccccccccccccccccccccccccccc-man-cache.drv" [label = "man-cache"];
+"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-etc.drv" -> "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-host.drv";
+"cccccccccccccccccccccccccccccccc-man-cache.drv" -> "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-etc.drv";
+}
+"#,
+    );
+
+    let path = state
+        .dependency_graph
+        .active_path(&["/nix/store/cccccccccccccccccccccccccccccccc-man-cache.drv".to_string()])
+        .unwrap();
+
+    assert_eq!(path.len(), 3);
+    assert_eq!(
+        state.dependency_graph.label(path.last().unwrap()),
+        "man-cache"
+    );
 }
 
 #[test]

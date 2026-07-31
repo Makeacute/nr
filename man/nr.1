@@ -1,4 +1,4 @@
-.TH NR 1 "July 2026" "nr 0.2.0" "User Commands"
+.TH NR 1 "July 2026" "nr 0.2.1" "User Commands"
 .SH NAME
 nr \- Git-aware NixOS lifecycle helper
 .SH SYNOPSIS
@@ -11,15 +11,16 @@ nr \- Git-aware NixOS lifecycle helper
 builds, previews, activates, updates, checks, and publishes a NixOS flake.
 Lifecycle commands build through
 .BR nixos-rebuild (8),
-parse Nix internal JSON events directly, show a bounded rebuild graph, explain
-closure and activation impact, and preserve the backend exit code.
+parse Nix internal JSON events directly, show a bounded derivation dependency
+graph, explain closure and activation impact, and preserve the backend exit
+code.
 .PP
 The full backend stream is captured in a log file. Terminal output is intended
 to answer what is changing, what is currently building or fetching, what
 activation would do, and how to recover.
 .PP
-The rich rebuild graph is built from Nix activity parent and child events. It
-is not a full derivation dependency graph.
+The rich rebuild graph is built from derivation edges loaded with
+.BR "nix-store --query --graph" .
 .SH COMMANDS
 .TP
 .B build
@@ -114,7 +115,7 @@ Pass remaining arguments directly to the backend command.
 Use rich output on interactive terminals and plain output otherwise.
 .TP
 .B rich
-Show a styled, bounded live Nix activity graph plus summaries.
+Show a styled, bounded live derivation dependency graph plus summaries.
 .TP
 .B plain
 Print stable script-friendly summaries and warnings or errors only.

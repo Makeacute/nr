@@ -39,7 +39,7 @@ TARGET SELECTION
 
 COMMON FLAGS
   --ui auto|rich|plain|raw|json
-                           Select command output mode. Rich mode shows an activity graph.
+                           Select command output mode. Rich mode shows a dependency graph.
   --log-file PATH          Capture the full backend log at PATH.
   --dry                    Alias lifecycle commands to preview-style behavior.
   --ask                    Ask before activation.

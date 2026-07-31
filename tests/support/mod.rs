@@ -63,6 +63,8 @@ pub fn fake_bin() -> (TestDir, PathBuf, PathBuf) {
 echo "nixos-rebuild $*" >> "$NR_FAKE_LOG"
 case "${1:-}" in
   build)
+    echo "these derivations will be built:" >&2
+    echo "  /nix/store/root-nixos-system-host.drv" >&2
     echo '@nix {"action":"start","id":1,"type":105,"text":"building '\''/nix/store/aaa-linux.drv'\''","fields":[]}' >&2
     echo '@nix {"action":"stop","id":1,"fields":[]}' >&2
     if [ "${NR_FAKE_BUILD_FAIL:-0}" = 1 ]; then
@@ -87,6 +89,32 @@ case "${1:-}" in
   *)
     echo "unexpected nixos-rebuild command: $*" >&2
     exit 99
+    ;;
+esac
+"#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("nix-store"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+echo "nix-store $*" >> "$NR_FAKE_LOG"
+case "$*" in
+  *"--query --graph /nix/store/root-nixos-system-host.drv"*)
+    cat <<'DOT'
+digraph G {
+"root-nixos-system-host.drv" [label = "nixos-system-host"];
+"aaa-linux.drv" [label = "linux"];
+"aaa-linux.drv" -> "root-nixos-system-host.drv";
+}
+DOT
+    ;;
+  *)
+    echo "unexpected nix-store command: $*" >&2
+    exit 97
     ;;
 esac
 "#,

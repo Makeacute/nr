@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -36,6 +37,7 @@ pub struct Activity {
     pub id: u64,
     pub parent: Option<u64>,
     pub text: String,
+    pub drv_path: Option<String>,
     pub category: BuildCategory,
     pub source_build: bool,
     pub substitute: bool,
@@ -81,6 +83,7 @@ pub struct BuildState {
     pub errors: Vec<String>,
     pub unknown_events: usize,
     pub parser_fallback: bool,
+    pub dependency_graph: DependencyGraph,
 }
 
 impl BuildState {
@@ -106,6 +109,31 @@ impl BuildState {
         self.running
             .values()
             .max_by_key(|activity| activity.started_at.elapsed())
+    }
+
+    pub fn active_derivation_paths(&self) -> Vec<String> {
+        self.running
+            .values()
+            .filter_map(|activity| activity.drv_path.clone())
+            .collect()
+    }
+
+    pub fn note_derivation_paths_from_text(&mut self, text: &str) {
+        for path in extract_derivation_paths(text) {
+            self.dependency_graph.note_path(&path);
+        }
+    }
+
+    pub fn dependency_graph_roots_to_load(&self) -> Vec<String> {
+        self.dependency_graph.roots_to_load()
+    }
+
+    pub fn note_derivation_graph(&mut self, root: &str, dot: &str) {
+        self.dependency_graph.note_dot_graph(root, dot);
+    }
+
+    pub fn mark_derivation_graph_attempted(&mut self, root: &str) {
+        self.dependency_graph.mark_attempted(root);
     }
 
     pub fn active_lineage_ids(&self) -> BTreeSet<u64> {
@@ -147,6 +175,10 @@ impl BuildState {
         let text = event_text(event);
         self.phase = classify_phase(&text).to_string();
         if let Some(id) = event.id {
+            let drv_path = extract_derivation_paths(&text).into_iter().next();
+            if let Some(path) = &drv_path {
+                self.dependency_graph.note_path(path);
+            }
             let substitute = is_substitute(&text);
             let source_build = is_source_build(&text);
             if substitute {
@@ -163,6 +195,7 @@ impl BuildState {
                 parent: event.parent,
                 category: categorize(&text),
                 text,
+                drv_path,
                 source_build,
                 substitute,
                 status: ActivityStatus::Running,
@@ -221,6 +254,109 @@ impl BuildState {
         } else if lower.contains("error") || lower.contains("failed") {
             self.errors.push(text);
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DependencyGraph {
+    edges: BTreeMap<String, Vec<String>>,
+    labels: BTreeMap<String, String>,
+    root_paths: BTreeMap<String, String>,
+    attempted_roots: BTreeSet<String>,
+}
+
+impl DependencyGraph {
+    pub fn note_path(&mut self, path: &str) {
+        let key = derivation_key(path);
+        self.labels
+            .entry(key.clone())
+            .or_insert_with(|| derivation_label(&key));
+        if is_system_derivation(&key) {
+            self.root_paths
+                .entry(key)
+                .or_insert_with(|| path.to_string());
+        }
+    }
+
+    pub fn roots_to_load(&self) -> Vec<String> {
+        self.root_paths
+            .iter()
+            .filter(|(key, _)| !self.attempted_roots.contains(*key))
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
+    pub fn mark_attempted(&mut self, root: &str) {
+        self.attempted_roots.insert(derivation_key(root));
+    }
+
+    pub fn note_dot_graph(&mut self, root: &str, dot: &str) {
+        self.mark_attempted(root);
+        for (key, label) in parse_dot_labels(dot) {
+            self.labels.entry(key).or_insert(label);
+        }
+        for (dependency, dependent) in parse_dot_edges(dot) {
+            self.edges.entry(dependent).or_default().push(dependency);
+        }
+        for children in self.edges.values_mut() {
+            children.sort();
+            children.dedup();
+        }
+    }
+
+    pub fn active_path(&self, active_derivations: &[String]) -> Option<Vec<String>> {
+        let active = active_derivations
+            .iter()
+            .map(|path| derivation_key(path))
+            .collect::<BTreeSet<_>>();
+        if active.is_empty() {
+            return None;
+        }
+        for root in self.root_paths.keys() {
+            if active.contains(root) {
+                return Some(vec![root.clone()]);
+            }
+            if let Some(path) = self.path_from_root(root, &active) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    pub fn label(&self, key: &str) -> String {
+        self.labels
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| derivation_label(key))
+    }
+
+    pub fn roots_loaded(&self) -> bool {
+        self.root_paths
+            .keys()
+            .any(|root| self.attempted_roots.contains(root))
+    }
+
+    fn path_from_root(&self, root: &str, active: &BTreeSet<String>) -> Option<Vec<String>> {
+        let mut queue = VecDeque::from([vec![root.to_string()]]);
+        let mut seen = BTreeSet::from([root.to_string()]);
+        while let Some(path) = queue.pop_front() {
+            let current = path.last()?;
+            let Some(children) = self.edges.get(current) else {
+                continue;
+            };
+            for child in children {
+                if !seen.insert(child.clone()) {
+                    continue;
+                }
+                let mut next = path.clone();
+                next.push(child.clone());
+                if active.contains(child) {
+                    return Some(next);
+                }
+                queue.push_back(next);
+            }
+        }
+        None
     }
 }
 
@@ -326,6 +462,107 @@ pub fn categorize(text: &str) -> BuildCategory {
     } else {
         BuildCategory::Other
     }
+}
+
+pub fn extract_derivation_paths(text: &str) -> Vec<String> {
+    let marker = "/nix/store/";
+    let mut paths = Vec::new();
+    let mut offset = 0usize;
+    while let Some(index) = text[offset..].find(marker) {
+        let start = offset + index;
+        let rest = &text[start..];
+        let end = rest
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '\'' | '"' | ')' | '(' | '[' | ']' | '{' | '}' | ',' | ';'
+                    )
+            })
+            .unwrap_or(rest.len());
+        let path = rest[..end].trim_end_matches(':').trim_end_matches('.');
+        if path.ends_with(".drv") {
+            paths.push(path.to_string());
+        }
+        offset = start + end.max(marker.len());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn parse_dot_labels(dot: &str) -> Vec<(String, String)> {
+    dot.lines()
+        .filter_map(|line| {
+            let strings = quoted_strings(line);
+            if strings.len() < 2 || line.contains("->") {
+                return None;
+            }
+            Some((derivation_key(&strings[0]), strings[1].clone()))
+        })
+        .collect()
+}
+
+fn parse_dot_edges(dot: &str) -> Vec<(String, String)> {
+    dot.lines()
+        .filter_map(|line| {
+            if !line.contains("->") {
+                return None;
+            }
+            let strings = quoted_strings(line);
+            if strings.len() < 2 {
+                return None;
+            }
+            Some((derivation_key(&strings[0]), derivation_key(&strings[1])))
+        })
+        .collect()
+}
+
+fn quoted_strings(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            match character {
+                '\\' => escaped = true,
+                '"' => {
+                    values.push(current.clone());
+                    current.clear();
+                    in_string = false;
+                }
+                _ => current.push(character),
+            }
+        } else if character == '"' {
+            in_string = true;
+        }
+    }
+    values
+}
+
+fn derivation_key(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn derivation_label(key: &str) -> String {
+    let name = key.strip_suffix(".drv").unwrap_or(key);
+    name.split_once('-')
+        .map(|(_, label)| label)
+        .unwrap_or(name)
+        .to_string()
+}
+
+fn is_system_derivation(key: &str) -> bool {
+    derivation_label(key).starts_with("nixos-system-")
 }
 
 fn event_text(event: &NixEvent) -> String {

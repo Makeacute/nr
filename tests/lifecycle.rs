@@ -42,6 +42,7 @@ fn preview_builds_diffs_and_dry_activates_without_switching() {
 
     let log = support::command_log(&command_log);
     assert!(log.contains("nixos-rebuild build"));
+    assert!(log.contains("nix-store --query --graph"));
     assert!(log.contains("nixos-rebuild dry-activate"));
     assert!(!log.contains("nixos-rebuild switch"));
 }

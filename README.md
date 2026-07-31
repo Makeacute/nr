@@ -33,9 +33,9 @@ Lifecycle commands use a bounded command UI rather than a full-screen TUI.
 During a build, `nr` reads
 `nixos-rebuild build --log-format internal-json --verbose`, tracks
 active/completed/failed build activities, groups derivations by broad system
-category, and repaints a compact parent/child graph from Nix activity events.
-Long derivation names are shortened in the terminal; the full backend stream
-stays in the log file.
+category, loads derivation edges with `nix-store --query --graph`, and repaints
+a compact dependency graph for the active build path. Long derivation names are
+shortened in the terminal; the full backend stream stays in the log file.
 
 After a successful build, `nr` compares `/run/current-system` to the new system
 with `nix store diff-closures`. For `switch`, `test`, and `preview`, it also

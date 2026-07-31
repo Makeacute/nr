@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -8,7 +7,7 @@ use serde_json::json;
 use terminal_size::{Width, terminal_size};
 
 use crate::config::FlakeTarget;
-use crate::events::{Activity, ActivityStatus, BuildState, NixEvent};
+use crate::events::{BuildState, NixEvent};
 use crate::git::GitSummary;
 use crate::impact::{ActivationImpact, ClosureDiff, GenerationInfo};
 use crate::process::{StreamLine, StreamSource};
@@ -264,34 +263,16 @@ fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
             categories
         }
     ));
-    lines.push("system closure".to_string());
-
-    let lineage = state.active_lineage_ids();
-    if lineage.is_empty() {
-        lines.push("`-- waiting for Nix activity".to_string());
+    lines.push("Dependency Graph:".to_string());
+    let active_derivations = state.active_derivation_paths();
+    if let Some(path) = state.dependency_graph.active_path(&active_derivations) {
+        push_dependency_path(state, &path, &mut lines, 12);
+    } else if state.dependency_graph.roots_loaded() {
+        lines.push("`-- waiting for an active derivation in the loaded graph".to_string());
+        push_active_derivations(&active_derivations, &mut lines);
     } else {
-        let children = lineage_children(state, &lineage);
-        let roots = children.get(&None).cloned().unwrap_or_default();
-        let mut graph = GraphRender {
-            state,
-            children: &children,
-            rendered: 0,
-            max_nodes: 10,
-            lines: &mut lines,
-        };
-        for (index, id) in roots.iter().enumerate() {
-            if graph.rendered >= graph.max_nodes {
-                break;
-            }
-            graph.push_node(*id, "", index + 1 == roots.len());
-        }
-        let rendered = graph.rendered;
-        if lineage.len() > rendered {
-            lines.push(format!(
-                "`-- ... {} more graph nodes",
-                lineage.len() - rendered
-            ));
-        }
+        lines.push("`-- waiting for nix-store derivation graph".to_string());
+        push_active_derivations(&active_derivations, &mut lines);
     }
 
     if let Some(activity) = state.slowest_active() {
@@ -315,101 +296,40 @@ fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn lineage_children(
+fn push_dependency_path(
     state: &BuildState,
-    lineage: &BTreeSet<u64>,
-) -> BTreeMap<Option<u64>, Vec<u64>> {
-    let mut children: BTreeMap<Option<u64>, Vec<u64>> = BTreeMap::new();
-    for id in lineage {
-        let Some(activity) = state.nodes.get(id) else {
-            continue;
-        };
-        let parent = activity.parent.filter(|parent| lineage.contains(parent));
-        children.entry(parent).or_default().push(*id);
-    }
-    children
-}
-
-struct GraphRender<'a> {
-    state: &'a BuildState,
-    children: &'a BTreeMap<Option<u64>, Vec<u64>>,
-    rendered: usize,
+    path: &[String],
+    lines: &mut Vec<String>,
     max_nodes: usize,
-    lines: &'a mut Vec<String>,
-}
-
-impl GraphRender<'_> {
-    fn push_node(&mut self, id: u64, prefix: &str, is_last: bool) {
-        if self.rendered >= self.max_nodes {
-            return;
-        }
-        let Some(activity) = self.state.nodes.get(&id) else {
-            return;
+) {
+    for (index, key) in path.iter().take(max_nodes).enumerate() {
+        let indent = "    ".repeat(index);
+        let connector = if index + 1 == path.len() {
+            "`--"
+        } else {
+            "|--"
         };
-        let connector = if is_last { "`--" } else { "|--" };
-        self.lines.push(format!(
-            "{prefix}{connector} {}",
-            activity_summary(activity)
+        lines.push(format!(
+            "{indent}{connector} {}",
+            state.dependency_graph.label(key)
         ));
-        self.rendered += 1;
-
-        let Some(child_ids) = self.children.get(&Some(id)) else {
-            return;
-        };
-        let next_prefix = format!("{prefix}{}", if is_last { "    " } else { "|   " });
-        for (index, child_id) in child_ids.iter().enumerate() {
-            if self.rendered >= self.max_nodes {
-                return;
-            }
-            self.push_node(*child_id, &next_prefix, index + 1 == child_ids.len());
-        }
+    }
+    if path.len() > max_nodes {
+        lines.push(format!(
+            "{} `-- ... {} more dependencies",
+            "    ".repeat(max_nodes),
+            path.len() - max_nodes
+        ));
     }
 }
 
-fn activity_summary(activity: &Activity) -> String {
-    let mut details = vec![
-        activity.category.label().to_string(),
-        provenance(activity).to_string(),
-    ];
-    if activity.status == ActivityStatus::Running {
-        details.push(format_duration(activity.started_at.elapsed()));
+fn push_active_derivations(active_derivations: &[String], lines: &mut Vec<String>) {
+    if active_derivations.is_empty() {
+        return;
     }
-    format!(
-        "{} {} [{}]",
-        activity_status(activity),
-        compact_activity_text(&activity.text),
-        details.join(" ")
-    )
-}
-
-fn activity_status(activity: &Activity) -> &'static str {
-    match activity.status {
-        ActivityStatus::Running => activity_kind(activity),
-        ActivityStatus::Completed => "done",
-        ActivityStatus::Failed => "fail",
-    }
-}
-
-fn activity_kind(activity: &Activity) -> &'static str {
-    let lower = activity.text.to_lowercase();
-    if activity.substitute {
-        "fetch"
-    } else if lower.contains("evaluat") {
-        "eval"
-    } else if activity.source_build {
-        "build"
-    } else {
-        "wait"
-    }
-}
-
-fn provenance(activity: &Activity) -> &'static str {
-    if activity.substitute {
-        "cache"
-    } else if activity.source_build {
-        "source"
-    } else {
-        "event"
+    lines.push("active derivations:".to_string());
+    for path in active_derivations.iter().take(4) {
+        lines.push(format!("  - {}", compact_activity_text(path)));
     }
 }
 
@@ -680,6 +600,10 @@ mod tests {
             parent: None,
             text: "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-linux-with-a-very-long-name.drv'"
                 .to_string(),
+            drv_path: Some(
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-linux-with-a-very-long-name.drv"
+                    .to_string(),
+            ),
             category: BuildCategory::KernelBoot,
             source_build: true,
             substitute: false,
@@ -691,6 +615,7 @@ mod tests {
             parent: Some(1),
             text: "evaluating derivation 'git+file:///etc/nixos#nixosConfigurations.\"nixos\".config.system.build.toplevel'"
                 .to_string(),
+            drv_path: Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-man-cache.drv".to_string()),
             category: BuildCategory::Other,
             source_build: false,
             substitute: false,
@@ -700,14 +625,29 @@ mod tests {
         state.nodes.insert(parent.id, parent);
         state.nodes.insert(child.id, child.clone());
         state.running.insert(child.id, child);
+        state
+            .dependency_graph
+            .note_path("/nix/store/cccccccccccccccccccccccccccccccc-nixos-system-nixos.drv");
+        state.dependency_graph.note_dot_graph(
+            "/nix/store/cccccccccccccccccccccccccccccccc-nixos-system-nixos.drv",
+            r#"
+digraph G {
+"cccccccccccccccccccccccccccccccc-nixos-system-nixos.drv" [label = "nixos-system-nixos"];
+"dddddddddddddddddddddddddddddddd-etc.drv" [label = "etc"];
+"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-man-cache.drv" [label = "man-cache"];
+"dddddddddddddddddddddddddddddddd-etc.drv" -> "cccccccccccccccccccccccccccccccc-nixos-system-nixos.drv";
+"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-man-cache.drv" -> "dddddddddddddddddddddddddddddddd-etc.drv";
+}
+"#,
+        );
 
         let lines = build_graph_lines(&state, 64);
 
         assert!(lines.iter().any(|line| line.contains("build graph")));
-        assert!(lines.iter().any(|line| line.contains("system closure")));
-        assert!(lines.iter().any(|line| line.contains("done")));
-        assert!(lines.iter().any(|line| line.contains("eval")));
-        assert!(lines.iter().any(|line| line.starts_with("    `--")));
+        assert!(lines.iter().any(|line| line.contains("Dependency Graph")));
+        assert!(lines.iter().any(|line| line.contains("nixos-system-nixos")));
+        assert!(lines.iter().any(|line| line.contains("man-cache")));
+        assert!(lines.iter().any(|line| line.contains("`-- man-cache")));
         assert!(lines.iter().all(|line| line.chars().count() <= 64));
     }
 

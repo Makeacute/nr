@@ -246,6 +246,7 @@ fn stream_nix_build(
     let mut fallback_announced = false;
     let code = stream_command(command, true, |line| {
         let _ = log.write_line(line.source, &line.line);
+        learn_dependency_graphs(&mut state, &line.line, log);
         if state.parser_fallback {
             renderer.backend_line(&line);
             return;
@@ -253,6 +254,9 @@ fn stream_nix_build(
         match parse_line(&line.line) {
             ParsedLine::Event(event) => {
                 state.ingest(&event);
+                for field in &event.fields {
+                    learn_dependency_graphs(&mut state, field, log);
+                }
                 renderer.nix_event(&event, &state);
             }
             ParsedLine::Plain(_) => renderer.backend_line(&line),
@@ -267,6 +271,31 @@ fn stream_nix_build(
         }
     })?;
     Ok(BuildRun { code, state })
+}
+
+fn learn_dependency_graphs(state: &mut BuildState, text: &str, log: &mut LogFile) {
+    state.note_derivation_paths_from_text(text);
+    for root in state.dependency_graph_roots_to_load() {
+        let command = backend::nix_store_query_graph_command(&root);
+        let _ = log.write_command(&command);
+        match run_capture(&command, false) {
+            Ok(output) if output.code == 0 => {
+                let _ = log.write_output(&output);
+                state.note_derivation_graph(&root, &output.stdout);
+            }
+            Ok(output) => {
+                let _ = log.write_output(&output);
+                state.mark_derivation_graph_attempted(&root);
+            }
+            Err(error) => {
+                let _ = log.write_line(
+                    crate::process::StreamSource::Stderr,
+                    &format!("failed to load derivation graph for {root}: {error}"),
+                );
+                state.mark_derivation_graph_attempted(&root);
+            }
+        }
+    }
 }
 
 fn stream_plain_command(

@@ -5,7 +5,7 @@ use crate::config::NrConfig;
 use crate::git::{git_command, git_summary};
 use crate::process::run_capture;
 
-const REQUIRED_TOOLS: &[&str] = &["nix", "nixos-rebuild", "git"];
+const REQUIRED_TOOLS: &[&str] = &["nix", "nix-store", "nixos-rebuild", "git"];
 const OPTIONAL_TOOLS: &[&str] = &["gh", "nixfmt", "statix", "cargo"];
 
 pub fn run_doctor(config: &NrConfig) -> crate::errors::Result<i32> {
