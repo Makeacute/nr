@@ -23,7 +23,7 @@ pub fn run_publish(config: &NrConfig, args: &PublishArgs) -> Result<i32> {
     let mode = match args.mode {
         Some(mode) => mode,
         None => match prompt_commit_mode() {
-            Some("single") => PublishMode::Single,
+            Some("commit") => PublishMode::Commit,
             Some("per-file") => PublishMode::PerFile,
             _ => {
                 println!("Publish cancelled.");
@@ -34,12 +34,12 @@ pub fn run_publish(config: &NrConfig, args: &PublishArgs) -> Result<i32> {
 
     if mode == PublishMode::PerFile && args.message.is_some() {
         return Err(NrError::message(
-            "--message can only be used with --mode single.",
+            "--message can only be used with --mode commit.",
         ));
     }
 
     let committed = match mode {
-        PublishMode::Single => publish_single_commit(config, args.message.as_deref())?,
+        PublishMode::Commit => publish_single_commit(config, args.message.as_deref())?,
         PublishMode::PerFile => publish_per_file(config)?,
     };
 
@@ -66,15 +66,15 @@ fn prompt_commit_mode() -> Option<&'static str> {
     let choice = choose(
         "Commit mode",
         &[
-            ("single", "one commit for all changes"),
+            ("commit", "one commit for all changes"),
             ("per-file", "one commit per file/logical change"),
         ],
-        Some("single"),
+        Some("commit"),
     )?;
     Some(if choice == "per-file" {
         "per-file"
     } else {
-        "single"
+        "commit"
     })
 }
 
@@ -191,7 +191,7 @@ fn commit_message(message: Option<&str>) -> Result<String> {
         }
         return Ok(message.to_string());
     }
-    let value = read_line("Commit message", None)
+    let value = read_line("Commit message:", None)
         .ok_or_else(|| NrError::message("Commit message is required."))?;
     let value = value.trim();
     if value.is_empty() {

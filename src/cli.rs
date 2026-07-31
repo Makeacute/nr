@@ -130,7 +130,8 @@ pub struct GenerationsArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum PublishMode {
-    Single,
+    #[value(alias = "single")]
+    Commit,
     PerFile,
 }
 

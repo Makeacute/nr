@@ -25,7 +25,7 @@ UPDATES AND CHECKS
 
 PUBLISHING
   nr publish               Review changes, choose commit mode, commit, then ask to push.
-  nr publish --mode single Commit all changes together.
+  nr publish --mode commit Commit all changes together.
   nr publish --mode per-file
                            Commit each changed file/logical change separately.
   nr publish --push        Push after committing without asking.

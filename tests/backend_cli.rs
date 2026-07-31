@@ -2,7 +2,7 @@ use nr::backend::{
     BackendOptions, nix_store_diff_closures_command, nixos_rebuild_build_command, nom_json_command,
     rollback_command,
 };
-use nr::cli::{Cli, NrCommand};
+use nr::cli::{Cli, NrCommand, PublishMode};
 use nr::config::FlakeTarget;
 use std::path::PathBuf;
 
@@ -121,4 +121,19 @@ fn cli_reports_missing_values() {
     let error = Cli::parse_from(["nr", "--flake"]).unwrap_err().to_string();
 
     assert!(error.contains("a value is required"));
+}
+
+#[test]
+fn cli_publish_mode_defaults_to_commit_name_with_single_alias() {
+    let cli = Cli::parse_from(["nr", "publish", "--mode", "commit"]).unwrap();
+    let Some(NrCommand::Publish(args)) = cli.command else {
+        panic!("expected publish");
+    };
+    assert_eq!(args.mode, Some(PublishMode::Commit));
+
+    let cli = Cli::parse_from(["nr", "publish", "--mode", "single"]).unwrap();
+    let Some(NrCommand::Publish(args)) = cli.command else {
+        panic!("expected publish");
+    };
+    assert_eq!(args.mode, Some(PublishMode::Commit));
 }
