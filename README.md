@@ -1,5 +1,4 @@
 # nr
-
 `nr` is a safe, Git-aware NixOS lifecycle CLI built on top of `nh`.
 
 It is currently alpha software. The goal is to make the daily NixOS workflow
