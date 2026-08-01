@@ -127,7 +127,14 @@ Forward the
 privilege-elevation method used by dry activation, activation, and rollback.
 .TP
 .B --ask-elevate-password
-Ask for the privilege-elevation password during activation.
+Force an elevation-password prompt. This is already the default for
+interactive non-root
+.BR switch ,
+.BR test ,
+.BR boot ,
+and
+.B rollback
+when no elevation option is supplied.
 .TP
 .B --notify
 Send a desktop notification when lifecycle commands finish. If

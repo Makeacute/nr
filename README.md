@@ -66,7 +66,7 @@ Output modes:
 --ui json               Final structured report as JSON
 --log-file PATH         Capture the full backend log at PATH
 --elevate METHOD        Forward nixos-rebuild elevation method: none, sudo, run0
---ask-elevate-password  Ask for the elevation password during activation
+--ask-elevate-password  Force elevation prompt; default for interactive switch/test/boot/rollback
 --notify                Send notify-send notification when lifecycle commands finish
 ```
 
