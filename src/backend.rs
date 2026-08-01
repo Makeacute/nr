@@ -76,6 +76,50 @@ pub fn nixos_rebuild_build_command(target: &FlakeTarget, options: &BackendOption
     CommandSpec::new("nixos-rebuild").args(args)
 }
 
+pub fn home_manager_build_command(target: &FlakeTarget, options: &BackendOptions) -> CommandSpec {
+    home_manager_lifecycle_command("build", target, options)
+}
+
+pub fn home_manager_switch_command(target: &FlakeTarget, options: &BackendOptions) -> CommandSpec {
+    home_manager_lifecycle_command("switch", target, options)
+}
+
+pub fn home_manager_generations_command(backend_args: &[String]) -> CommandSpec {
+    let mut args = vec!["generations".to_string()];
+    args.extend(passthrough_args(backend_args));
+    CommandSpec::new("home-manager").args(args)
+}
+
+fn home_manager_lifecycle_command(
+    action: &str,
+    target: &FlakeTarget,
+    options: &BackendOptions,
+) -> CommandSpec {
+    let mut args = vec![
+        action.to_string(),
+        "--flake".to_string(),
+        target.reference(),
+    ];
+    args.extend(home_manager_common_args(options));
+    args.extend(passthrough_args(&options.backend_args));
+    CommandSpec::new("home-manager").args(args)
+}
+
+fn home_manager_common_args(options: &BackendOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    if options.show_trace {
+        args.push("--show-trace".to_string());
+    }
+    if options.offline {
+        args.extend([
+            "--option".to_string(),
+            "substitute".to_string(),
+            "false".to_string(),
+        ]);
+    }
+    args
+}
+
 pub fn nixos_rebuild_dry_activate_command(
     store_path: &Path,
     options: &BackendOptions,

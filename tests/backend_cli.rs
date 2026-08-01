@@ -1,11 +1,12 @@
 use clap::CommandFactory;
 use nr::backend::{
-    BackendOptions, generations_json_command, nix_collect_garbage_command,
+    BackendOptions, generations_json_command, home_manager_build_command,
+    home_manager_generations_command, home_manager_switch_command, nix_collect_garbage_command,
     nix_store_diff_closures_command, nixos_rebuild_activate_command, nixos_rebuild_build_command,
     nixos_rebuild_dry_activate_command, nom_json_command, notify_send_command, rollback_command,
     rollback_to_store_path_command, uname_kernel_release_command,
 };
-use nr::cli::{Cli, NrCommand, PublishMode};
+use nr::cli::{BisectProbe, Cli, HmCommand, NrCommand, PublishMode};
 use nr::config::FlakeTarget;
 use std::path::PathBuf;
 
@@ -149,6 +150,44 @@ fn nom_command_consumes_internal_json_logs() {
 }
 
 #[test]
+fn home_manager_commands_target_flake_outputs() {
+    let target = FlakeTarget {
+        path: PathBuf::from("/flake"),
+        host: "lucian".to_string(),
+    };
+    let options = BackendOptions {
+        offline: true,
+        show_trace: true,
+        backend_args: vec!["--impure".to_string()],
+        ..BackendOptions::default()
+    };
+
+    assert_eq!(
+        home_manager_build_command(&target, &options).to_vec(),
+        [
+            "home-manager",
+            "build",
+            "--flake",
+            "/flake#lucian",
+            "--show-trace",
+            "--option",
+            "substitute",
+            "false",
+            "--impure",
+        ]
+        .map(String::from)
+    );
+    assert_eq!(
+        home_manager_switch_command(&target, &BackendOptions::default()).to_vec(),
+        ["home-manager", "switch", "--flake", "/flake#lucian"].map(String::from)
+    );
+    assert_eq!(
+        home_manager_generations_command(&["--json".to_string()]).to_vec(),
+        ["home-manager", "generations", "--json"].map(String::from)
+    );
+}
+
+#[test]
 fn uname_command_reads_running_kernel_release() {
     assert_eq!(
         uname_kernel_release_command().to_vec(),
@@ -249,6 +288,43 @@ fn cli_accepts_new_lifecycle_subcommands() {
     assert_eq!(args.from.as_deref(), Some("41"));
     assert_eq!(args.to.as_deref(), Some("/tmp/system"));
     assert_eq!(args.backend_args, ["--offline"].map(String::from));
+
+    let cli = Cli::parse_from([
+        "nr",
+        "--flake",
+        "/flake#lucian",
+        "hm",
+        "preview",
+        "--home",
+        "desktop",
+        "--",
+        "--impure",
+    ])
+    .unwrap();
+    let Some(NrCommand::Hm(HmCommand::Preview(args))) = cli.command else {
+        panic!("expected hm preview");
+    };
+    assert_eq!(args.home.as_deref(), Some("desktop"));
+    assert_eq!(args.backend_args, ["--impure"].map(String::from));
+
+    let cli = Cli::parse_from([
+        "nr",
+        "bisect",
+        "42",
+        "--good",
+        "41",
+        "--probe",
+        "build",
+        "--no-reset",
+    ])
+    .unwrap();
+    let Some(NrCommand::Bisect(args)) = cli.command else {
+        panic!("expected bisect");
+    };
+    assert_eq!(args.broken, "42");
+    assert_eq!(args.good.as_deref(), Some("41"));
+    assert_eq!(args.probe, BisectProbe::Build);
+    assert!(args.no_reset);
 
     let cli = Cli::parse_from(["nr", "gc", "--dry-run", "--older-than", "30d"]).unwrap();
     let Some(NrCommand::Gc(args)) = cli.command else {

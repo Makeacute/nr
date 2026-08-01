@@ -17,6 +17,9 @@ nr switch               Build, diff, dry-activate, then activate
 nr test                 Activate until the next reboot
 nr boot                 Build and make the generation the next boot default
 nr preview              Build, diff, and dry-activate without mutating
+nr bisect [BAD]         Binary-search Git history for a generation regression
+nr hm switch            Build and activate a Home Manager flake output
+nr hm preview           Build and diff Home Manager without activating
 nr apply [PLAN]         Activate a saved preview plan without rebuilding
 nr rollback             Roll back to the previous generation
 nr generations          Show NixOS generations

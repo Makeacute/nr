@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod bisect;
 pub mod checks;
 pub mod cli;
 pub mod color;
@@ -11,6 +12,7 @@ pub mod find;
 pub mod generations;
 pub mod git;
 pub mod help;
+pub mod hm;
 pub mod impact;
 pub mod inputs;
 pub mod lifecycle;

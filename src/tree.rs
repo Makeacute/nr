@@ -8,17 +8,21 @@ use crate::errors::{IoContext, Result};
 
 pub fn run_tree(config: &NrConfig, args: &TreeArgs) -> Result<i32> {
     let color = ColorChoice::new(args.no_color);
+    let show_files = !args.dirs_only || args.files;
+    let show_sizes = args.sizes || args.files;
+    let max_depth = args.depth.unwrap_or(usize::MAX);
     let mut summary = TreeSummary::default();
-    count_summary(&config.target.path, 1, args.depth, &mut summary)?;
+    count_summary(&config.target.path, 1, max_depth, &mut summary)?;
     println!("{}", config.target.host);
-    let entries = read_entries(&config.target.path, args.files)?;
+    let entries = read_entries(&config.target.path, show_files)?;
     render_entries(
         &config.target.path,
         &entries,
         "",
         1,
-        args.depth,
-        args.files,
+        max_depth,
+        show_files,
+        show_sizes,
         color,
     )?;
     println!(
@@ -56,6 +60,7 @@ fn render_entries(
     depth: usize,
     max_depth: usize,
     show_files: bool,
+    show_sizes: bool,
     color: ColorChoice,
 ) -> Result<()> {
     if depth > max_depth {
@@ -66,7 +71,7 @@ fn render_entries(
         let connector = if last { "└── " } else { "├── " };
         println!(
             "{prefix}{connector}{}",
-            entry_label(root, entry, show_files, color)?
+            entry_label(root, entry, show_sizes, color)?
         );
         if entry.kind == EntryKind::Directory {
             let children = read_entries(&entry.path, show_files)?;
@@ -75,9 +80,10 @@ fn render_entries(
                 root,
                 &children,
                 &child_prefix,
-                depth + 1,
+                depth.saturating_add(1),
                 max_depth,
                 show_files,
+                show_sizes,
                 color,
             )?;
         }
@@ -97,7 +103,7 @@ fn count_summary(
     for entry in read_entries(directory, true)? {
         count_entry(&entry, summary);
         if entry.kind == EntryKind::Directory {
-            count_summary(&entry.path, depth + 1, max_depth, summary)?;
+            count_summary(&entry.path, depth.saturating_add(1), max_depth, summary)?;
         }
     }
     Ok(())
@@ -149,18 +155,7 @@ fn sort_rank(entry: &TreeEntry) -> u8 {
 }
 
 fn should_skip(path: &Path, name: &str) -> Result<bool> {
-    if matches!(
-        name,
-        ".git" | "target" | ".direnv" | "__pycache__" | "node_modules"
-    ) {
-        return Ok(true);
-    }
-    if name.starts_with("result")
-        && fs::symlink_metadata(path)
-            .with_context(format!("failed to inspect {}", path.display()))?
-            .file_type()
-            .is_symlink()
-    {
+    if name.starts_with('.') || matches!(name, "target" | "__pycache__" | "node_modules") {
         return Ok(true);
     }
     Ok(path
@@ -171,7 +166,7 @@ fn should_skip(path: &Path, name: &str) -> Result<bool> {
 fn entry_label(
     root: &Path,
     entry: &TreeEntry,
-    show_files: bool,
+    show_sizes: bool,
     color: ColorChoice,
 ) -> Result<String> {
     let mut label = entry.name.clone();
@@ -180,7 +175,7 @@ fn entry_label(
             .with_context(format!("failed to read symlink {}", entry.path.display()))?;
         label = format!("{label} -> {}", destination.display());
     }
-    if entry.kind == EntryKind::File && show_files {
+    if entry.kind == EntryKind::File && show_sizes {
         let size = fs::metadata(&entry.path)
             .with_context(format!("failed to stat {}", entry.path.display()))?
             .len();
@@ -238,6 +233,57 @@ fn is_asset(path: &Path) -> bool {
                 | "yml"
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn entries_include_visible_files_and_skip_dot_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir(root.join("home")).expect("create home");
+        fs::write(root.join("flake.nix"), "{}\n").expect("write flake");
+        fs::write(root.join("README.md"), "# nr\n").expect("write readme");
+        fs::create_dir(root.join(".ruff_cache")).expect("create ruff cache");
+        fs::write(root.join(".env"), "SECRET=1\n").expect("write env");
+        fs::write(root.join(".ruff_cache").join("cache.json"), "{}\n").expect("write cache");
+
+        let entries = read_entries(root, true).expect("read entries");
+        let names = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["home", "README.md", "flake.nix"]);
+    }
+
+    #[test]
+    fn directory_only_mode_hides_files_but_summary_counts_visible_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir(root.join("system")).expect("create system");
+        fs::write(root.join("system").join("default.nix"), "{}\n").expect("write nix");
+        fs::write(root.join("README.md"), "# nr\n").expect("write readme");
+        fs::create_dir(root.join(".direnv")).expect("create direnv");
+        fs::write(root.join(".direnv").join("ignored.nix"), "{}\n").expect("write ignored");
+        symlink("/nix/store/fake-system", root.join("result")).expect("symlink result");
+
+        let entries = read_entries(root, false).expect("read directory-only entries");
+        let names = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["system"]);
+
+        let mut summary = TreeSummary::default();
+        count_summary(root, 1, 4, &mut summary).expect("count summary");
+        assert_eq!(summary.directories, 1);
+        assert_eq!(summary.nix_files, 1);
+        assert_eq!(summary.other_files, 2);
+    }
 }
 
 fn format_size(size: u64) -> String {

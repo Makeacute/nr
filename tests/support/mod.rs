@@ -159,6 +159,34 @@ esac
     .unwrap();
 
     write_executable(
+        &bin.join("home-manager"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+echo "home-manager $*" >> "$NR_FAKE_LOG"
+case "${1:-}" in
+  build)
+    ln -sfn /nix/store/fake-home-manager-generation "$PWD/result"
+    echo "built home manager"
+    ;;
+  switch)
+    echo "switched home manager"
+    ;;
+  generations)
+    echo "2026-08-01 10:00 : id 2"
+    echo "2026-07-31 10:00 : id 1"
+    ;;
+  *)
+    echo "unexpected home-manager command: $*" >&2
+    exit 94
+    ;;
+esac
+"#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
         &bin.join("nix"),
         &script_with_shell(
             &shell,

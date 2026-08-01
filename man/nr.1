@@ -42,6 +42,20 @@ activating it immediately.
 Build into a temporary directory, show the closure diff, and dry-activate
 without mutating bootloader or profile state.
 .TP
+.B bisect
+Binary-search Git history for a generation regression. By default, resolves the
+bad generation and previous good generation to their recorded Git revisions and
+runs
+.BR "git bisect run nr preview" .
+.TP
+.B hm
+Run Home Manager lifecycle commands. Supported subcommands include
+.BR build ,
+.BR switch ,
+.BR preview ,
+and
+.BR generations .
+.TP
 .B apply
 Activate a saved preview plan without rebuilding.
 .TP

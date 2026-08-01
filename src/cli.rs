@@ -131,6 +131,10 @@ pub enum NrCommand {
     Boot(LifecycleArgs),
     #[command(about = "Build, diff, and dry-activate without mutating")]
     Preview(Passthrough),
+    #[command(about = "Binary-search Git history for a generation regression")]
+    Bisect(BisectArgs),
+    #[command(subcommand, about = "Run Home Manager lifecycle commands")]
+    Hm(HmCommand),
     #[command(about = "Activate a saved preview plan without rebuilding")]
     Apply(ApplyArgs),
     #[command(about = "Update flake.lock or selected flake inputs")]
@@ -206,6 +210,100 @@ pub struct LifecycleArgs {
         help = "Activate a saved preview plan instead of rebuilding"
     )]
     pub from_plan: Option<String>,
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
+    pub backend_args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum BisectProbe {
+    Build,
+    #[default]
+    Preview,
+    Check,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct BisectArgs {
+    #[arg(
+        value_name = "BAD_GENERATION_OR_REV",
+        default_value = "current",
+        help = "Known-bad generation, pin, or Git revision"
+    )]
+    pub broken: String,
+    #[arg(
+        long,
+        value_name = "GENERATION_OR_REV",
+        help = "Known-good generation, pin, or Git revision; defaults to the previous generation"
+    )]
+    pub good: Option<String>,
+    #[arg(
+        long,
+        value_name = "REV",
+        help = "Known-bad Git revision; overrides BAD_GENERATION_OR_REV revision lookup"
+    )]
+    pub bad: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "preview",
+        help = "Built-in probe to run at each commit when no custom command is provided"
+    )]
+    pub probe: BisectProbe,
+    #[arg(long, help = "Allow bisecting with local Git changes present")]
+    pub allow_dirty: bool,
+    #[arg(long, help = "Leave the repository in Git bisect state when finished")]
+    pub no_reset: bool,
+    #[arg(
+        last = true,
+        value_name = "COMMAND",
+        allow_hyphen_values = true,
+        help = "Custom git bisect run command passed after --"
+    )]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum HmCommand {
+    #[command(about = "Build the selected Home Manager configuration")]
+    Build(HmLifecycleArgs),
+    #[command(about = "Build and activate the selected Home Manager configuration")]
+    Switch(HmLifecycleArgs),
+    #[command(about = "Build and diff Home Manager without activating")]
+    Preview(HmLifecycleArgs),
+    #[command(about = "Show Home Manager generations")]
+    Generations(HmGenerationsArgs),
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct HmLifecycleArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Home Manager flake output name; defaults to --flake #fragment, --host, or $USER"
+    )]
+    pub home: Option<String>,
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        help = "Current Home Manager profile to diff for preview"
+    )]
+    pub profile: Option<PathBuf>,
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
+    pub backend_args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct HmGenerationsArgs {
     #[arg(
         last = true,
         value_name = "BACKEND_ARG",
@@ -300,10 +398,14 @@ pub struct ExportArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct TreeArgs {
-    #[arg(long, default_value_t = 4, help = "Maximum directory depth to render")]
-    pub depth: usize,
-    #[arg(long, help = "Show files as well as directories")]
+    #[arg(long, help = "Maximum directory depth to render")]
+    pub depth: Option<usize>,
+    #[arg(long, hide = true, help = "Show files as well as directories")]
     pub files: bool,
+    #[arg(long, help = "Show only directories")]
+    pub dirs_only: bool,
+    #[arg(long, help = "Show file sizes")]
+    pub sizes: bool,
     #[arg(long, help = "Disable colored output")]
     pub no_color: bool,
 }
@@ -655,6 +757,14 @@ pub fn run() -> Result<i32> {
         NrCommand::Boot(args) => crate::lifecycle::run_lifecycle_command("boot", &cli, args),
         NrCommand::Preview(args) => {
             crate::lifecycle::run_lifecycle("preview", &cli, &args.backend_args)
+        }
+        NrCommand::Bisect(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::bisect::run_bisect(&cli, &config, args)
+        }
+        NrCommand::Hm(command) => {
+            let config = load_config(cli.config_input())?;
+            crate::hm::run_hm(&cli, &config, command)
         }
         NrCommand::Apply(args) => crate::lifecycle::run_apply(&cli, args),
         NrCommand::Update(args) => {

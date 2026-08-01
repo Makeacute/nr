@@ -51,6 +51,128 @@ fn preview_builds_diffs_and_dry_activates_without_switching() {
 }
 
 #[test]
+fn hm_preview_builds_and_does_not_switch() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .env("XDG_STATE_HOME", flake.path().join("state"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "plain",
+            "hm",
+            "preview",
+            "--home",
+            "lucian",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("preview complete; no activation performed"));
+
+    let log = support::command_log(&command_log);
+    assert!(log.contains("home-manager build --flake"));
+    assert!(log.contains("#lucian"));
+    assert!(!log.contains("home-manager switch"));
+}
+
+#[test]
+fn hm_switch_invokes_home_manager_switch() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "plain",
+            "hm",
+            "switch",
+            "--home",
+            "lucian",
+            "--",
+            "--impure",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = support::command_log(&command_log);
+    assert!(log.contains("home-manager switch --flake"));
+    assert!(log.contains("#lucian"));
+    assert!(log.contains("--impure"));
+}
+
+#[test]
+fn dry_hm_switch_builds_preview_without_switching() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .env("XDG_STATE_HOME", flake.path().join("state"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--dry",
+            "hm",
+            "switch",
+            "--home",
+            "lucian",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = support::command_log(&command_log);
+    assert!(log.contains("home-manager build --flake"));
+    assert!(!log.contains("home-manager switch"));
+}
+
+#[test]
 fn preview_saves_plan_and_apply_uses_it_without_rebuilding() {
     let flake = support::TestDir::new();
     support::make_flake(flake.path());
