@@ -112,15 +112,18 @@ fn publish_per_file(config: &NrConfig) -> Result<bool> {
     }
 
     let mut committed = false;
+    let mut committed_count = 0usize;
     if let Some(path) = staged.first() {
         println!("Pre-staged change: {path}");
         if !confirm("Commit this staged change first?", true) {
             println!("Stopped before unstaged files so the existing index stays untouched.");
+            print_per_file_summary(committed_count, &[]);
             return Ok(false);
         }
         review_staged_diff(flake_path)?;
         checked(&commit_command(flake_path, &commit_message(None)?))?;
         committed = true;
+        committed_count += 1;
     }
 
     let mut skipped: Vec<Vec<String>> = Vec::new();
@@ -161,9 +164,24 @@ fn publish_per_file(config: &NrConfig) -> Result<bool> {
         }
         checked(&commit_command(flake_path, &commit_message(None)?))?;
         committed = true;
+        committed_count += 1;
     }
 
+    print_per_file_summary(committed_count, &skipped);
     Ok(committed)
+}
+
+fn print_per_file_summary(committed: usize, skipped: &[Vec<String>]) {
+    println!("committed {committed}, skipped {}", skipped.len());
+    if skipped.is_empty() {
+        return;
+    }
+    let remaining = skipped
+        .iter()
+        .map(|paths| paths.join(", "))
+        .collect::<Vec<_>>()
+        .join("; ");
+    println!("remaining unstaged: {remaining}");
 }
 
 fn has_staged_changes(flake_path: &std::path::Path) -> Result<bool> {

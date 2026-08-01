@@ -16,6 +16,7 @@ pub fn run_inputs(cli: &Cli, config: &NrConfig, args: &InputsArgs) -> Result<i32
                 inputs: args.update.clone(),
                 switch: false,
                 revert_on_failure: false,
+                preview: false,
             },
         );
     }

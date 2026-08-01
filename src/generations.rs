@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::backend;
 use crate::cli::{GenerationsArgs, PinArgs, PinsArgs, UnpinArgs};
+use crate::color::ColorChoice;
 use crate::errors::{IoContext, NrError, Result};
 use crate::process::{CommandSpec, run_capture, run_inherit, state_dir};
 
@@ -44,7 +46,7 @@ pub fn run_generations(args: &GenerationsArgs) -> Result<i32> {
 
     let generations = load_system_generations()?;
     let pins = load_pins()?;
-    print_generations(&generations, &pins);
+    print_generations(&generations, &pins, ColorChoice::new(args.no_color));
     Ok(0)
 }
 
@@ -277,8 +279,13 @@ fn safe_pin_label(label: &str) -> String {
     }
 }
 
-fn print_generations(generations: &[SystemGeneration], pins: &PinsFile) {
-    println!("Generation  Build-date           NixOS version            Kernel   Current  Pin");
+fn print_generations(generations: &[SystemGeneration], pins: &PinsFile, color: ColorChoice) {
+    println!(
+        "{}",
+        color.bold(
+            "Generation  Build-date           NixOS version            Kernel   Current  Pin"
+        )
+    );
     for generation in generations {
         let labels = pins
             .pins
@@ -296,14 +303,61 @@ fn print_generations(generations: &[SystemGeneration], pins: &PinsFile) {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        println!(
+        let pin_badge = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("[pinned: {labels}]")
+        };
+        let line = format!(
             "{:<10}  {:<19}  {:<23}  {:<7}  {:<7}  {}",
             generation.generation,
             generation.date,
             generation.nixos_version,
             generation.kernel_version,
             if generation.current { "yes" } else { "no" },
-            labels
+            pin_badge
         );
+        if generation.current {
+            println!("{}", color.bold_green(line));
+        } else if !labels.is_empty() {
+            println!("{}", color.bold_cyan(line));
+        } else if older_than_days(&generation.date, 30) {
+            println!("{}", color.dim(line));
+        } else {
+            println!("{line}");
+        }
     }
+}
+
+fn older_than_days(date: &str, days: i64) -> bool {
+    let Some(day) = date_days_since_epoch(date) else {
+        return false;
+    };
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now_days = (duration.as_secs() / 86_400) as i64;
+    now_days.saturating_sub(day) > days
+}
+
+fn date_days_since_epoch(date: &str) -> Option<i64> {
+    let prefix = date.get(0..10)?;
+    let mut parts = prefix.split('-');
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let month = parts.next()?.parse::<i64>().ok()?;
+    let day = parts.next()?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }

@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::cli::InitConfigArgs;
+use crate::cli::{ConfigCheckArgs, InitConfigArgs};
+use crate::color::ColorChoice;
 use crate::errors::{IoContext, NrError, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,6 +366,332 @@ pub fn run_init_config(input: &ConfigInput, args: &InitConfigArgs) -> Result<i32
         .with_context(format!("failed to write {}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(0)
+}
+
+pub fn run_config_check(config: &NrConfig, _args: &ConfigCheckArgs) -> Result<i32> {
+    let environment = env::vars().collect::<Vec<(String, String)>>();
+    let user_path = config
+        .user_config_path
+        .clone()
+        .unwrap_or_else(|| user_config_path(&environment));
+    let repo_path = config
+        .repo_config_path
+        .clone()
+        .unwrap_or_else(|| config.target.path.join(".nr.toml"));
+    let user_data = read_config(&user_path)?;
+    let repo_data = read_config(&repo_path)?;
+    let rows = config_rows(config, user_data.as_ref(), repo_data.as_ref());
+    let color = ColorChoice::new(false);
+
+    println!("{:<28}  {:<8}  VALUE", "SETTING", "SOURCE");
+    for row in rows {
+        let line = format!("{:<28}  {:<8}  {}", row.setting, row.source, row.value);
+        if row.differs_from_default {
+            println!("{}", color.bold(line));
+        } else {
+            println!("{line}");
+        }
+    }
+    Ok(0)
+}
+
+#[derive(Clone, Debug)]
+struct ConfigRow {
+    setting: &'static str,
+    source: &'static str,
+    value: String,
+    differs_from_default: bool,
+}
+
+fn config_rows(
+    config: &NrConfig,
+    user: Option<&ConfigData>,
+    repo: Option<&ConfigData>,
+) -> Vec<ConfigRow> {
+    let defaults = ConfigDefaults::default();
+    vec![
+        row(
+            "target.flake",
+            source(
+                user.and_then(|data| data.target.flake.as_ref()),
+                None::<&String>,
+            ),
+            config.target.path.display().to_string(),
+            config.target.path != Path::new("/etc/nixos"),
+        ),
+        row(
+            "target.host",
+            source(
+                user.and_then(|data| data.target.host.as_ref()),
+                repo.and_then(|data| data.target.host.as_ref()),
+            ),
+            config.target.host.clone(),
+            config.target.host != "nixos",
+        ),
+        row(
+            "target.target_host",
+            source(
+                user.and_then(|data| data.target.target_host.as_ref()),
+                repo.and_then(|data| data.target.target_host.as_ref()),
+            ),
+            option_value(&config.remote.target_host),
+            config.remote.target_host != defaults.remote.target_host,
+        ),
+        row(
+            "target.build_host",
+            source(
+                user.and_then(|data| data.target.build_host.as_ref()),
+                repo.and_then(|data| data.target.build_host.as_ref()),
+            ),
+            option_value(&config.remote.build_host),
+            config.remote.build_host != defaults.remote.build_host,
+        ),
+        row(
+            "target.use_remote_sudo",
+            source(
+                user.and_then(|data| data.target.use_remote_sudo.as_ref()),
+                repo.and_then(|data| data.target.use_remote_sudo.as_ref()),
+            ),
+            config.remote.use_remote_sudo.to_string(),
+            config.remote.use_remote_sudo != defaults.remote.use_remote_sudo,
+        ),
+        row(
+            "check.flake",
+            source(
+                user.and_then(|data| data.check.flake.as_ref()),
+                repo.and_then(|data| data.check.flake.as_ref()),
+            ),
+            config.check.flake.to_string(),
+            config.check.flake != defaults.check.flake,
+        ),
+        row(
+            "check.nixfmt",
+            source(
+                user.and_then(|data| data.check.nixfmt.as_ref()),
+                repo.and_then(|data| data.check.nixfmt.as_ref()),
+            ),
+            config.check.nixfmt.to_string(),
+            config.check.nixfmt != defaults.check.nixfmt,
+        ),
+        row(
+            "check.statix",
+            source(
+                user.and_then(|data| data.check.statix.as_ref()),
+                repo.and_then(|data| data.check.statix.as_ref()),
+            ),
+            config.check.statix.to_string(),
+            config.check.statix != defaults.check.statix,
+        ),
+        row(
+            "check.cargo_fmt",
+            source(
+                user.and_then(|data| data.check.cargo_fmt.as_ref()),
+                repo.and_then(|data| data.check.cargo_fmt.as_ref()),
+            ),
+            config.check.cargo_fmt.to_string(),
+            config.check.cargo_fmt != defaults.check.cargo_fmt,
+        ),
+        row(
+            "check.clippy",
+            source(
+                user.and_then(|data| data.check.clippy.as_ref()),
+                repo.and_then(|data| data.check.clippy.as_ref()),
+            ),
+            config.check.clippy.to_string(),
+            config.check.clippy != defaults.check.clippy,
+        ),
+        row(
+            "check.commands",
+            source(
+                user.and_then(|data| data.check.commands.as_ref()),
+                repo.and_then(|data| data.check.commands.as_ref()),
+            ),
+            format!("{:?}", config.check.commands),
+            config.check.commands != defaults.check.commands,
+        ),
+        row(
+            "publish.remote",
+            source(
+                user.and_then(|data| data.publish.remote.as_ref()),
+                repo.and_then(|data| data.publish.remote.as_ref()),
+            ),
+            config.publish.remote.clone(),
+            config.publish.remote != defaults.publish.remote,
+        ),
+        row(
+            "hooks.timeout_seconds",
+            source(
+                user.and_then(|data| data.hooks.timeout_seconds.as_ref()),
+                repo.and_then(|data| data.hooks.timeout_seconds.as_ref()),
+            ),
+            config.hooks.timeout_seconds.to_string(),
+            config.hooks.timeout_seconds != defaults.hooks.timeout_seconds,
+        ),
+        row(
+            "hooks.pre_build",
+            source(
+                user.and_then(|data| data.hooks.pre_build.as_ref()),
+                repo.and_then(|data| data.hooks.pre_build.as_ref()),
+            ),
+            format!("{:?}", config.hooks.pre_build),
+            config.hooks.pre_build != defaults.hooks.pre_build,
+        ),
+        row(
+            "hooks.post_build",
+            source(
+                user.and_then(|data| data.hooks.post_build.as_ref()),
+                repo.and_then(|data| data.hooks.post_build.as_ref()),
+            ),
+            format!("{:?}", config.hooks.post_build),
+            config.hooks.post_build != defaults.hooks.post_build,
+        ),
+        row(
+            "hooks.pre_activate",
+            source(
+                user.and_then(|data| data.hooks.pre_activate.as_ref()),
+                repo.and_then(|data| data.hooks.pre_activate.as_ref()),
+            ),
+            format!("{:?}", config.hooks.pre_activate),
+            config.hooks.pre_activate != defaults.hooks.pre_activate,
+        ),
+        row(
+            "hooks.post_activate",
+            source(
+                user.and_then(|data| data.hooks.post_activate.as_ref()),
+                repo.and_then(|data| data.hooks.post_activate.as_ref()),
+            ),
+            format!("{:?}", config.hooks.post_activate),
+            config.hooks.post_activate != defaults.hooks.post_activate,
+        ),
+        row(
+            "hooks.post_switch",
+            source(
+                user.and_then(|data| data.hooks.post_switch.as_ref()),
+                repo.and_then(|data| data.hooks.post_switch.as_ref()),
+            ),
+            format!("{:?}", config.hooks.post_switch),
+            config.hooks.post_switch != defaults.hooks.post_switch,
+        ),
+        row(
+            "hooks.on_failure",
+            source(
+                user.and_then(|data| data.hooks.on_failure.as_ref()),
+                repo.and_then(|data| data.hooks.on_failure.as_ref()),
+            ),
+            format!("{:?}", config.hooks.on_failure),
+            config.hooks.on_failure != defaults.hooks.on_failure,
+        ),
+        row(
+            "ui.accent",
+            source(
+                user.and_then(|data| data.ui.accent.as_ref()),
+                repo.and_then(|data| data.ui.accent.as_ref()),
+            ),
+            option_value(&config.ui.accent),
+            config.ui.accent != defaults.ui.accent,
+        ),
+        row(
+            "ui.graph_depth",
+            source(
+                user.and_then(|data| data.ui.graph_depth.as_ref()),
+                repo.and_then(|data| data.ui.graph_depth.as_ref()),
+            ),
+            config.ui.graph_depth.to_string(),
+            config.ui.graph_depth != defaults.ui.graph_depth,
+        ),
+        row(
+            "ui.refresh_ms",
+            source(
+                user.and_then(|data| data.ui.refresh_ms.as_ref()),
+                repo.and_then(|data| data.ui.refresh_ms.as_ref()),
+            ),
+            config.ui.refresh_ms.to_string(),
+            config.ui.refresh_ms != defaults.ui.refresh_ms,
+        ),
+        row(
+            "ui.verbose_backend",
+            source(
+                user.and_then(|data| data.ui.verbose_backend.as_ref()),
+                repo.and_then(|data| data.ui.verbose_backend.as_ref()),
+            ),
+            config.ui.verbose_backend.to_string(),
+            config.ui.verbose_backend != defaults.ui.verbose_backend,
+        ),
+        row(
+            "state.keep_logs",
+            source(
+                user.and_then(|data| data.state.keep_logs.as_ref()),
+                repo.and_then(|data| data.state.keep_logs.as_ref()),
+            ),
+            config.state.keep_logs.to_string(),
+            config.state.keep_logs != defaults.state.keep_logs,
+        ),
+        row(
+            "state.keep_reports",
+            source(
+                user.and_then(|data| data.state.keep_reports.as_ref()),
+                repo.and_then(|data| data.state.keep_reports.as_ref()),
+            ),
+            config.state.keep_reports.to_string(),
+            config.state.keep_reports != defaults.state.keep_reports,
+        ),
+        row(
+            "state.keep_history",
+            source(
+                user.and_then(|data| data.state.keep_history.as_ref()),
+                repo.and_then(|data| data.state.keep_history.as_ref()),
+            ),
+            config.state.keep_history.to_string(),
+            config.state.keep_history != defaults.state.keep_history,
+        ),
+        row(
+            "state.keep_plans",
+            source(
+                user.and_then(|data| data.state.keep_plans.as_ref()),
+                repo.and_then(|data| data.state.keep_plans.as_ref()),
+            ),
+            config.state.keep_plans.to_string(),
+            config.state.keep_plans != defaults.state.keep_plans,
+        ),
+    ]
+}
+
+#[derive(Default)]
+struct ConfigDefaults {
+    remote: RemoteSettings,
+    check: CheckSettings,
+    publish: PublishSettings,
+    hooks: HookSettings,
+    ui: UiSettings,
+    state: StateSettings,
+}
+
+fn row(
+    setting: &'static str,
+    source: &'static str,
+    value: String,
+    differs_from_default: bool,
+) -> ConfigRow {
+    ConfigRow {
+        setting,
+        source,
+        value,
+        differs_from_default,
+    }
+}
+
+fn source<T>(user: Option<&T>, repo: Option<&T>) -> &'static str {
+    if repo.is_some() {
+        "repo"
+    } else if user.is_some() {
+        "user"
+    } else {
+        "default"
+    }
+}
+
+fn option_value(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "-".to_string())
 }
 
 fn finish_config(

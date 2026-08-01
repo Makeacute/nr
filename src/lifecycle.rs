@@ -12,9 +12,10 @@ use serde_json::Value;
 
 use crate::backend;
 use crate::cli::{
-    ApplyArgs, Cli, DiffArgs, GcArgs, HistoryArgs, LifecycleArgs, LogsArgs, RollbackArgs,
-    ShowReportArgs, UpdateArgs,
+    ApplyArgs, Cli, DiffArgs, GcArgs, HistoryArgs, HistoryFormat, LifecycleArgs, LogsArgs,
+    RollbackArgs, ShowReportArgs, UpdateArgs,
 };
+use crate::color::ColorChoice;
 use crate::config::{
     FlakeTarget, HookCommand, NrConfig, load_config, split_flake_reference, validate_flake_path,
 };
@@ -112,6 +113,7 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
         persist_report_state(&config, &report, false)?;
         run_failure_hooks(&config, &mut log, &mut renderer, "build failed")?;
         log.flush()?;
+        print_last_log_errors(log.path());
         return Err(NrError::CommandFailed {
             command: build_command.render(),
             code: build.code,
@@ -281,7 +283,7 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
 
 pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32> {
     ensure_git_flake_visible(&config.target.path)?;
-    let lockfile_snapshot = if args.revert_on_failure || !args.inputs.is_empty() {
+    let lockfile_snapshot = if args.preview || args.revert_on_failure || !args.inputs.is_empty() {
         Some(LockfileSnapshot::capture(&config.target.path)?)
     } else {
         None
@@ -301,6 +303,9 @@ pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32
         &args.inputs,
         lockfile_snapshot.as_ref(),
     )?;
+    if args.preview {
+        return run_update_preview(cli, config, lockfile_snapshot.as_ref());
+    }
     if args.switch {
         match run_lifecycle("switch", cli, &[]) {
             Ok(code) => Ok(code),
@@ -310,6 +315,50 @@ pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32
             }
         }
     } else {
+        Ok(0)
+    }
+}
+
+fn run_update_preview(
+    cli: &Cli,
+    config: &NrConfig,
+    lockfile_snapshot: Option<&LockfileSnapshot>,
+) -> Result<i32> {
+    let options = lifecycle_backend_options("preview", true, cli, config, &[]);
+    let mut log = LogFile::create_with_limit(cli.log_file.clone(), config.state.keep_logs)?;
+    let mut renderer = Renderer::new_for_lifecycle(cli.ui, "update-preview", config.ui.clone());
+    let directory = tempfile::Builder::new()
+        .prefix("nr-update-preview-")
+        .tempdir()
+        .map_err(|error| NrError::Io {
+            context: "failed to create update preview build directory".to_string(),
+            source: error,
+        })?;
+    renderer.phase("evaluating/building");
+    let build_command =
+        backend::nixos_rebuild_build_command(&config.target, &options).cwd(directory.path());
+    let build = stream_nix_build(&build_command, &mut log, &mut renderer)?;
+    if build.code != 0 {
+        log.flush()?;
+        print_last_log_errors(log.path());
+        return Err(NrError::CommandFailed {
+            command: build_command.render(),
+            code: build.code,
+        });
+    }
+    let store_path = resolve_result_link(directory.path())?;
+    renderer.phase("diffing");
+    let diff = diff_current_to_new(&store_path, &options, &mut log)?;
+    renderer.diff(&diff);
+    log.flush()?;
+
+    if confirm("Switch to this update?", false) {
+        run_lifecycle("switch", cli, &[])
+    } else {
+        if let Some(snapshot) = lockfile_snapshot {
+            snapshot.restore()?;
+            eprintln!("reverted flake.lock to its pre-update state");
+        }
         Ok(0)
     }
 }
@@ -739,6 +788,7 @@ pub fn run_rollback(cli: &Cli, args: &RollbackArgs) -> Result<i32> {
         previous_generation(&generations).map(|generation| generation.generation)
     };
     print_rollback_target(&generations, target_generation);
+    print_rollback_diff(cli, target_generation, &options);
     wait_for_rollback_confirmation()?;
 
     let command = rollback_target_command(
@@ -754,6 +804,33 @@ pub fn run_rollback(cli: &Cli, args: &RollbackArgs) -> Result<i32> {
     }
     println!("rollback complete. To inspect generations, run: nr generations");
     Ok(0)
+}
+
+fn print_rollback_diff(
+    cli: &Cli,
+    target_generation: Option<u64>,
+    options: &backend::BackendOptions,
+) {
+    let Some(target_generation) = target_generation else {
+        return;
+    };
+    let Ok(config) = load_config(cli.config_input()) else {
+        return;
+    };
+    let Ok(mut log) = LogFile::create_with_limit(cli.log_file.clone(), config.state.keep_logs)
+    else {
+        return;
+    };
+    let Ok(diff) = diff_current_to_new(&generation_path(target_generation), options, &mut log)
+    else {
+        return;
+    };
+    if diff.unavailable.is_some() {
+        return;
+    }
+    let mut renderer = Renderer::new_for_lifecycle(cli.ui, "rollback", config.ui.clone());
+    renderer.diff(&diff);
+    let _ = log.flush();
 }
 
 pub fn run_gc(args: &GcArgs) -> Result<i32> {
@@ -816,19 +893,91 @@ pub fn run_history(args: &HistoryArgs) -> Result<i32> {
     })?;
     let history = serde_json::from_str::<HistoryFile>(&text)
         .map_err(|error| NrError::message(format!("failed to parse history: {error}")))?;
-    for entry in history.entries.iter().rev().take(args.limit) {
-        println!(
-            "{} {} {} old:{:?} new:{:?} {} log:{}",
-            entry.timestamp,
-            entry.action,
-            entry.target,
-            entry.old_generation,
-            entry.new_generation,
-            entry.report_result,
-            entry.log_path.display()
-        );
+    let entries = history
+        .entries
+        .iter()
+        .rev()
+        .take(args.limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    if args.format == HistoryFormat::Json {
+        let text = serde_json::to_string_pretty(&entries)
+            .map_err(|error| NrError::message(format!("failed to serialize history: {error}")))?;
+        println!("{text}");
+    } else {
+        print_history_table(&entries);
     }
     Ok(0)
+}
+
+fn print_history_table(entries: &[HistoryEntry]) {
+    let color = ColorChoice::new(false);
+    println!(
+        "{}",
+        color.bold(format!(
+            "{:<16}  {:<8}  {:<14}  {:<4}  {:<4}  RESULT",
+            "TIMESTAMP", "ACTION", "TARGET", "OLD", "NEW"
+        ))
+    );
+    for entry in entries {
+        let line = format!(
+            "{:<16}  {:<8}  {:<14}  {:<4}  {:<4}  {}",
+            relative_time(entry.timestamp),
+            entry.action,
+            history_target(&entry.target),
+            generation_cell(entry.old_generation),
+            generation_cell(entry.new_generation),
+            entry.report_result
+        );
+        if history_failed(entry) {
+            println!("{}", color.red(line));
+        } else {
+            println!("{line}");
+        }
+    }
+}
+
+fn relative_time(timestamp: u64) -> String {
+    let now = state::timestamp();
+    if timestamp >= now {
+        return "just now".to_string();
+    }
+    let seconds = now - timestamp;
+    if seconds < 60 {
+        return plural(seconds, "second");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return plural(minutes, "minute");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return plural(hours, "hour");
+    }
+    let days = hours / 24;
+    plural(days, "day")
+}
+
+fn plural(value: u64, unit: &str) -> String {
+    let suffix = if value == 1 { "" } else { "s" };
+    format!("{value} {unit}{suffix} ago")
+}
+
+fn history_target(target: &str) -> String {
+    target
+        .rsplit_once('#')
+        .map(|(_, host)| host.to_string())
+        .unwrap_or_else(|| target.to_string())
+}
+
+fn generation_cell(value: Option<u64>) -> String {
+    value
+        .map(|generation| generation.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn history_failed(entry: &HistoryEntry) -> bool {
+    entry.report_result.to_lowercase().contains("failed")
 }
 
 pub fn run_logs(args: &LogsArgs) -> Result<i32> {
@@ -1149,6 +1298,25 @@ fn diff_paths(
     Ok(parse_closure_diff(&output.stdout))
 }
 
+fn print_last_log_errors(path: &Path) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let errors = text
+        .lines()
+        .filter(|line| line.contains("error:"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return;
+    }
+    eprintln!("▶ last errors from log:");
+    let start = errors.len().saturating_sub(20);
+    for line in &errors[start..] {
+        eprintln!("{line}");
+    }
+}
+
 struct BuildRun {
     code: i32,
     state: BuildState,
@@ -1220,6 +1388,7 @@ fn persist_success_state(
         };
         let path = state::write_json(&state::plans_dir(), "plan", &plan, config.state.keep_plans)?;
         eprintln!("preview plan saved: {}", path.display());
+        append_history(config, header, report)?;
     } else if matches!(report.command.as_str(), "switch" | "test" | "boot") {
         append_history(config, header, report)?;
     }

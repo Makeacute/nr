@@ -118,7 +118,11 @@ impl Renderer {
     pub fn new_for_lifecycle(mode: OutputMode, action: &str, settings: UiSettings) -> Self {
         Self {
             mode: mode.effective_for_lifecycle(action),
-            accent: settings.accent.and_then(|value| AccentColor::parse(&value)),
+            accent: if std::env::var_os("NO_COLOR").is_some() {
+                None
+            } else {
+                settings.accent.and_then(|value| AccentColor::parse(&value))
+            },
             last_rich_render: Instant::now() - Duration::from_secs(1),
             last_rich_lines: 0,
             last_rich_width: None,

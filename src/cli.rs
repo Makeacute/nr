@@ -1,7 +1,8 @@
 use std::env;
 use std::ffi::OsString;
-use std::io;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
@@ -10,6 +11,7 @@ use crate::VERSION;
 use crate::backend::BackendOptions;
 use crate::config::{ConfigInput, NrConfig, load_config};
 use crate::errors::{IoContext, NrError, Result};
+use crate::prompts::confirm;
 use crate::ui::OutputMode;
 
 #[derive(Debug, Clone, Parser)]
@@ -133,6 +135,16 @@ pub enum NrCommand {
     Apply(ApplyArgs),
     #[command(about = "Update flake.lock or selected flake inputs")]
     Update(UpdateArgs),
+    #[command(about = "Copy or print a privacy-aware system summary")]
+    Share(ShareArgs),
+    #[command(about = "Create a portable archive of the flake")]
+    Export(ExportArgs),
+    #[command(about = "Render the flake directory as a tree")]
+    Tree(TreeArgs),
+    #[command(about = "Search Nix files in the flake")]
+    Find(FindArgs),
+    #[command(about = "Open a Nix file from the flake in $EDITOR")]
+    Open(OpenArgs),
     #[command(about = "Roll back to the previous generation")]
     Rollback(RollbackArgs),
     #[command(about = "Show NixOS generations")]
@@ -163,6 +175,12 @@ pub enum NrCommand {
     Publish(PublishArgs),
     #[command(about = "Run configured checks")]
     Check(CheckArgs),
+    #[command(about = "Run nixfmt and deadnix on changed Nix files")]
+    Lint(LintArgs),
+    #[command(about = "Create, list, or restore flake snapshots")]
+    Snapshot(SnapshotArgs),
+    #[command(about = "Show merged config settings and their source")]
+    ConfigCheck(ConfigCheckArgs),
     #[command(about = "Show target, config, dependency, and Git diagnostics")]
     Doctor,
     #[command(about = "Show the complete terminal cheat sheet")]
@@ -247,6 +265,93 @@ pub struct UpdateArgs {
     pub switch: bool,
     #[arg(long, help = "Restore flake.lock if the post-update switch fails")]
     pub revert_on_failure: bool,
+    #[arg(long, help = "Update, diff, then ask before switching")]
+    pub preview: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ShareFormat {
+    Text,
+    #[default]
+    Markdown,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct ShareArgs {
+    #[arg(long, help = "Print instead of copying to the clipboard")]
+    pub no_clipboard: bool,
+    #[arg(long, value_enum, default_value = "markdown", help = "Summary format")]
+    pub format: ShareFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ExportArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Archive path to write; defaults to ./nr-export-<timestamp>.tar.gz"
+    )]
+    pub output: Option<PathBuf>,
+    #[arg(long, help = "Include files that look like secrets")]
+    pub include_secrets: bool,
+    #[arg(long, help = "List files without creating the archive")]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct TreeArgs {
+    #[arg(long, default_value_t = 4, help = "Maximum directory depth to render")]
+    pub depth: usize,
+    #[arg(long, help = "Show files as well as directories")]
+    pub files: bool,
+    #[arg(long, help = "Disable colored output")]
+    pub no_color: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum FindType {
+    #[default]
+    AutoDetect,
+    Package,
+    Option,
+    String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum FindFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct FindArgs {
+    #[arg(value_name = "QUERY", help = "Search query")]
+    pub query: String,
+    #[arg(
+        long = "type",
+        value_enum,
+        default_value = "auto-detect",
+        help = "Search type hint"
+    )]
+    pub search_type: FindType,
+    #[arg(long, help = "Match case exactly")]
+    pub case_sensitive: bool,
+    #[arg(long, default_value_t = 2, help = "Context lines around each match")]
+    pub context: usize,
+    #[arg(long, value_enum, default_value = "text", help = "Output format")]
+    pub format: FindFormat,
+    #[arg(long, help = "Disable colored output")]
+    pub no_color: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OpenArgs {
+    #[arg(
+        value_name = "FILE",
+        help = "Relative .nix file path or filename fragment"
+    )]
+    pub file: String,
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -273,6 +378,8 @@ pub struct GenerationsArgs {
         help = "Nix profile path to inspect instead of the system profile"
     )]
     pub profile: Option<String>,
+    #[arg(long, help = "Disable colored output")]
+    pub no_color: bool,
     #[arg(
         last = true,
         value_name = "BACKEND_ARG",
@@ -355,6 +462,15 @@ pub struct PinsArgs {
 pub struct HistoryArgs {
     #[arg(long, default_value_t = 20, help = "Maximum history entries to print")]
     pub limit: usize,
+    #[arg(long, value_enum, default_value = "text", help = "Output format")]
+    pub format: HistoryFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum HistoryFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -438,6 +554,22 @@ pub struct CheckArgs {
     #[arg(long, value_name = "SECONDS", help = "Per-check timeout in seconds")]
     pub timeout: Option<u64>,
 }
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct LintArgs {}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct SnapshotArgs {
+    #[arg(long, value_name = "LABEL", help = "Create a snapshot with this name")]
+    pub name: Option<String>,
+    #[arg(long, help = "List snapshots")]
+    pub list: bool,
+    #[arg(long, value_name = "LABEL", help = "Restore a named snapshot")]
+    pub restore: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct ConfigCheckArgs {}
 
 impl Cli {
     pub fn backend_options(&self, backend_args: &[String]) -> BackendOptions {
@@ -529,6 +661,26 @@ pub fn run() -> Result<i32> {
             let config = load_config(cli.config_input())?;
             crate::lifecycle::run_update(&cli, &config, args)
         }
+        NrCommand::Share(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::share::run_share(&cli, &config, args)
+        }
+        NrCommand::Export(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::export::run_export(&config, args)
+        }
+        NrCommand::Tree(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::tree::run_tree(&config, args)
+        }
+        NrCommand::Find(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::find::run_find(&config, args)
+        }
+        NrCommand::Open(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::open::run_open(&config, args)
+        }
         NrCommand::Rollback(args) => crate::lifecycle::run_rollback(&cli, args),
         NrCommand::Generations(args) => crate::generations::run_generations(args),
         NrCommand::Diff(args) => crate::lifecycle::run_diff(&cli, args),
@@ -544,11 +696,7 @@ pub fn run() -> Result<i32> {
             crate::inputs::run_inputs(&cli, &config, args)
         }
         NrCommand::InitConfig(args) => crate::config::run_init_config(&cli.config_input(), args),
-        NrCommand::Completions(args) => {
-            let mut command = Cli::command();
-            generate(args.shell, &mut command, "nr", &mut io::stdout());
-            Ok(0)
-        }
+        NrCommand::Completions(args) => crate::cli::run_completions(args),
         NrCommand::Publish(args) => {
             let config = load_config(cli.config_input())?;
             crate::publish::run_publish(&config, args)
@@ -556,6 +704,18 @@ pub fn run() -> Result<i32> {
         NrCommand::Check(args) => {
             let config = load_config(cli.config_input())?;
             crate::checks::run_check(&cli, &config, args)
+        }
+        NrCommand::Lint(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::lint::run_lint(&config, args)
+        }
+        NrCommand::Snapshot(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::snapshot::run_snapshot(&cli, &config, args)
+        }
+        NrCommand::ConfigCheck(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::config::run_config_check(&config, args)
         }
         NrCommand::Doctor => {
             let config = load_config(cli.config_input())?;
@@ -572,4 +732,104 @@ fn print_help() -> Result<()> {
         .with_context("failed to print command help")?;
     println!();
     Ok(())
+}
+
+pub fn run_completions(args: &CompletionArgs) -> Result<i32> {
+    let mut command = Cli::command();
+    let mut output = Vec::new();
+    generate(args.shell, &mut command, "nr", &mut output);
+
+    if let Some(detected) = detected_shell()
+        && detected != args.shell
+    {
+        eprintln!("detected shell differs from requested completions; printing to stdout instead");
+        print_completion_bytes(&output)?;
+        return Ok(0);
+    }
+
+    let Some(path) = completion_install_path(args.shell) else {
+        print_completion_bytes(&output)?;
+        return Ok(0);
+    };
+
+    if !io::stdin().is_terminal() {
+        print_completion_bytes(&output)?;
+        return Ok(0);
+    }
+
+    println!("completion path: {}", path.display());
+    if confirm("Write completions here?", true) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&path, output).with_context(format!("failed to write {}", path.display()))?;
+        println!("wrote {}", path.display());
+        print_reload_instructions(args.shell);
+    } else {
+        print_completion_bytes(&output)?;
+    }
+    Ok(0)
+}
+
+fn print_completion_bytes(output: &[u8]) -> Result<()> {
+    let text = String::from_utf8(output.to_vec()).map_err(|error| {
+        NrError::message(format!("generated completions were not UTF-8: {error}"))
+    })?;
+    print!("{text}");
+    Ok(())
+}
+
+fn completion_install_path(shell: Shell) -> Option<PathBuf> {
+    match shell {
+        Shell::Fish => Some(home_dir().join(".config/fish/completions/nr.fish")),
+        Shell::Bash => Some(home_dir().join(".local/share/bash-completion/completions/nr")),
+        Shell::Zsh => zsh_completion_path(),
+        _ => None,
+    }
+}
+
+fn detected_shell() -> Option<Shell> {
+    let shell = env::var_os("SHELL")?;
+    let name = Path::new(&shell).file_name()?.to_str()?;
+    match name {
+        "fish" => Some(Shell::Fish),
+        "bash" => Some(Shell::Bash),
+        "zsh" => Some(Shell::Zsh),
+        _ => None,
+    }
+}
+
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn zsh_completion_path() -> Option<PathBuf> {
+    if let Some(fpath) = env::var_os("fpath").or_else(|| env::var_os("FPATH")) {
+        for path in env::split_paths(&fpath) {
+            if writable_directory(&path) {
+                return Some(path.join("nr"));
+            }
+        }
+    }
+    Some(home_dir().join(".zsh/completions/nr"))
+}
+
+fn writable_directory(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .metadata()
+            .map(|metadata| !metadata.permissions().readonly())
+            .unwrap_or(false)
+}
+
+fn print_reload_instructions(shell: Shell) {
+    match shell {
+        Shell::Fish => println!("Reload with: exec fish"),
+        Shell::Bash => println!("Reload with: source ~/.bashrc or start a new shell"),
+        Shell::Zsh => println!("Reload with: exec zsh"),
+        _ => println!("Start a new shell to load completions."),
+    }
 }
