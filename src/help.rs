@@ -12,6 +12,7 @@ CORE
   nr test                  Build and activate until the next reboot.
   nr boot                  Build and make the generation the next boot default.
   nr preview               Build, diff, and dry-activate without mutating.
+  nr apply latest          Activate the latest saved preview plan.
   nr rollback              Roll back to the previous generation.
   nr rollback LABEL        Roll back to a pinned generation label.
   nr generations           Show NixOS generations.
@@ -19,14 +20,22 @@ CORE
   nr gc                    Garbage collect generations older than 7d.
   nr gc --dry-run          Preview garbage collection.
   nr pin GEN LABEL         Label a generation for later rollback.
+  nr unpin LABEL           Remove a generation pin and GC root.
+  nr pins --check-stale    List pins and exit non-zero if any are stale.
+  nr history               Show bounded switch, test, and boot history.
+  nr logs                  List retained logs and reports.
+  nr show-report latest    Print the latest retained lifecycle report.
 
 UPDATES AND CHECKS
   nr update                Update flake.lock only.
   nr update nixpkgs        Update one flake input.
   nr update --switch       Update flake.lock, then build and activate.
+  nr inputs                Inspect flake inputs.
   nr check                 Run configured checks. Default: nix flake check.
   nr check --all           Also run nixfmt, statix, cargo fmt, and clippy.
   nr doctor                Show target, config, dependency, and Git diagnostics.
+  nr init-config           Create a starter .nr.toml.
+  nr completions bash      Generate shell completions.
 
 PUBLISHING
   nr publish               Review changes, choose commit mode, commit, then ask to push.
@@ -43,7 +52,7 @@ TARGET SELECTION
   ~/.config/nr/config.toml User defaults.
 
 COMMON FLAGS
-  --ui auto|rich|nom|plain|raw|json
+  --ui auto|rich|nom|plain|raw|json|jsonl
                            Select command output mode. auto uses nom for interactive lifecycle builds.
   --log-file PATH          Capture the full backend log at PATH.
   --dry                    Alias lifecycle commands to preview-style behavior.
@@ -54,7 +63,16 @@ COMMON FLAGS
   --ask-elevate-password   Prompt and pipe an elevation password instead of using sudo's prompt.
   --notify                 Send a desktop notification when lifecycle commands finish.
   --specialisation NAME    Build or activate a specialisation.
+  --target-host HOST       Forward nixos-rebuild --target-host.
+  --build-host HOST        Forward nixos-rebuild --build-host.
+  --use-remote-sudo        Forward nixos-rebuild --use-remote-sudo.
   --                       Pass remaining arguments directly to the backend.
+
+RETENTION
+  [state].keep_logs         Default: 20 retained logs.
+  [state].keep_reports      Default: 20 retained reports.
+  [state].keep_history      Default: 50 switch/test/boot entries.
+  [state].keep_plans        Default: 10 saved preview plans.
 
 WORKFLOWS
   Validate:                nr check --all -> nr build

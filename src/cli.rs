@@ -171,15 +171,29 @@ pub enum NrCommand {
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct Passthrough {
-    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
     pub backend_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct LifecycleArgs {
-    #[arg(long, value_name = "PLAN")]
+    #[arg(
+        long,
+        value_name = "PLAN",
+        help = "Activate a saved preview plan instead of rebuilding"
+    )]
     pub from_plan: Option<String>,
-    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
     pub backend_args: Vec<String>,
 }
 
@@ -203,37 +217,68 @@ impl ApplyAction {
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct ApplyArgs {
-    #[arg(value_name = "PLAN", default_value = "latest")]
+    #[arg(
+        value_name = "PLAN",
+        default_value = "latest",
+        help = "Preview plan to activate, or latest"
+    )]
     pub plan: String,
-    #[arg(long, value_enum, default_value = "switch")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "switch",
+        help = "Activation action to run from the saved plan"
+    )]
     pub action: ApplyAction,
-    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
     pub backend_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct UpdateArgs {
-    #[arg(value_name = "INPUT")]
+    #[arg(value_name = "INPUT", help = "Flake input to update")]
     pub inputs: Vec<String>,
-    #[arg(long)]
+    #[arg(long, help = "Build and activate after updating flake.lock")]
     pub switch: bool,
-    #[arg(long)]
+    #[arg(long, help = "Restore flake.lock if the post-update switch fails")]
     pub revert_on_failure: bool,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct RollbackArgs {
-    #[arg(value_name = "LABEL_OR_GENERATION")]
+    #[arg(
+        value_name = "LABEL_OR_GENERATION",
+        help = "Pin label or generation number to activate"
+    )]
     pub target: Option<String>,
-    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
     pub backend_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct GenerationsArgs {
-    #[arg(long, value_name = "PROFILE")]
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        help = "Nix profile path to inspect instead of the system profile"
+    )]
     pub profile: Option<String>,
-    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
     pub backend_args: Vec<String>,
 }
 
@@ -246,121 +291,151 @@ pub enum PublishMode {
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct DiffArgs {
-    #[arg(long, value_name = "GEN_OR_PATH")]
+    #[arg(
+        long,
+        value_name = "GEN_OR_PATH",
+        help = "Generation number or store path to compare from"
+    )]
     pub from: Option<String>,
-    #[arg(long, value_name = "PATH_OR_FLAKE")]
+    #[arg(
+        long,
+        value_name = "PATH_OR_FLAKE",
+        help = "Store path or flake reference to compare to"
+    )]
     pub to: Option<String>,
-    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    #[arg(
+        last = true,
+        value_name = "BACKEND_ARG",
+        allow_hyphen_values = true,
+        help = "Argument passed through after --"
+    )]
     pub backend_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct GcArgs {
-    #[arg(long, value_name = "AGE", default_value = "7d")]
+    #[arg(
+        long,
+        value_name = "AGE",
+        default_value = "7d",
+        help = "Minimum age for generations considered by garbage collection"
+    )]
     pub older_than: String,
-    #[arg(long)]
+    #[arg(long, help = "Delete all old generations with nix-collect-garbage -d")]
     pub delete_old: bool,
-    #[arg(long)]
+    #[arg(long, help = "Preview collection with nix-collect-garbage --dry-run")]
     pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct PinArgs {
-    #[arg(value_name = "GENERATION")]
+    #[arg(value_name = "GENERATION", help = "Generation number to label")]
     pub generation: u64,
-    #[arg(value_name = "LABEL")]
+    #[arg(value_name = "LABEL", help = "Label to use for later rollback")]
     pub label: String,
-    #[arg(long)]
+    #[arg(long, help = "Replace an existing pin with the same label")]
     pub force: bool,
-    #[arg(long)]
+    #[arg(long, help = "Record the pin without creating a Nix GC root")]
     pub no_gc_root: bool,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct UnpinArgs {
-    #[arg(value_name = "LABEL")]
+    #[arg(value_name = "LABEL", help = "Pin label to remove")]
     pub label: String,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct PinsArgs {
-    #[arg(long)]
+    #[arg(long, help = "Check whether pinned generations or GC roots are stale")]
     pub check_stale: bool,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct HistoryArgs {
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, help = "Maximum history entries to print")]
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct LogsArgs {
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, help = "Maximum retained items to print")]
     pub limit: usize,
-    #[arg(long)]
+    #[arg(long, help = "Print the log path for the latest failed report")]
     pub last_failed: bool,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct ShowReportArgs {
-    #[arg(value_name = "REPORT", default_value = "latest")]
+    #[arg(
+        value_name = "REPORT",
+        default_value = "latest",
+        help = "Report path, latest, or a filename fragment"
+    )]
     pub report: String,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct InputsArgs {
-    #[arg(long)]
+    #[arg(long, help = "Print flake input data as JSON")]
     pub json: bool,
-    #[arg(long, value_name = "INPUT")]
+    #[arg(
+        long,
+        value_name = "INPUT",
+        help = "Update one flake input before listing"
+    )]
     pub update: Vec<String>,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct InitConfigArgs {
-    #[arg(long)]
+    #[arg(long, help = "Write the starter config to the user config directory")]
     pub user: bool,
-    #[arg(long)]
+    #[arg(long, help = "Overwrite an existing config file")]
     pub force: bool,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct CompletionArgs {
-    #[arg(value_enum)]
+    #[arg(value_enum, help = "Shell to generate completions for")]
     pub shell: Shell,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct PublishArgs {
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, help = "Commit message to use")]
     pub message: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Push after committing")]
     pub push: bool,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Commit strategy")]
     pub mode: Option<PublishMode>,
-    #[arg(long, value_name = "REMOTE")]
+    #[arg(long, value_name = "REMOTE", help = "Git remote to push to")]
     pub remote: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Args)]
 pub struct CheckArgs {
-    #[arg(long)]
+    #[arg(long, help = "Run every configured check")]
     pub all: bool,
-    #[arg(long)]
+    #[arg(long, help = "Run nixfmt")]
     pub nixfmt: bool,
-    #[arg(long)]
+    #[arg(long, help = "Run statix")]
     pub statix: bool,
-    #[arg(long = "cargo-fmt")]
+    #[arg(long = "cargo-fmt", help = "Run cargo fmt --check")]
     pub cargo_fmt: bool,
-    #[arg(long)]
+    #[arg(long, help = "Run cargo clippy with warnings denied")]
     pub clippy: bool,
-    #[arg(long = "no-flake")]
+    #[arg(long = "no-flake", help = "Skip flake checks")]
     pub no_flake: bool,
-    #[arg(long)]
+    #[arg(long, help = "Print check results as JSON")]
     pub json: bool,
-    #[arg(long, value_name = "NAME")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Run checks whose name or command contains NAME"
+    )]
     pub only: Vec<String>,
-    #[arg(long, value_name = "SECONDS")]
+    #[arg(long, value_name = "SECONDS", help = "Per-check timeout in seconds")]
     pub timeout: Option<u64>,
 }
 
