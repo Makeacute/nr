@@ -1,3 +1,4 @@
+use clap::CommandFactory;
 use nr::backend::{
     BackendOptions, generations_json_command, nix_collect_garbage_command,
     nix_store_diff_closures_command, nixos_rebuild_activate_command, nixos_rebuild_build_command,
@@ -327,4 +328,60 @@ fn cli_publish_mode_defaults_to_commit_name_with_single_alias() {
         panic!("expected publish");
     };
     assert_eq!(args.mode, Some(PublishMode::Commit));
+}
+
+#[test]
+fn generated_help_has_no_blank_descriptions() {
+    let mut command = Cli::command();
+    assert_no_blank_help_descriptions("root", &command.render_long_help().to_string());
+
+    for name in [
+        "build",
+        "switch",
+        "test",
+        "boot",
+        "preview",
+        "apply",
+        "update",
+        "rollback",
+        "generations",
+        "diff",
+        "gc",
+        "pin",
+        "unpin",
+        "pins",
+        "history",
+        "logs",
+        "show-report",
+        "inputs",
+        "init-config",
+        "completions",
+        "publish",
+        "check",
+        "doctor",
+        "cheat",
+    ] {
+        let mut command = Cli::command();
+        let subcommand = command.find_subcommand_mut(name).unwrap_or_else(|| {
+            panic!("missing subcommand in generated help test: {name}");
+        });
+        assert_no_blank_help_descriptions(name, &subcommand.render_long_help().to_string());
+    }
+}
+
+fn assert_no_blank_help_descriptions(context: &str, help: &str) {
+    for line in help.lines() {
+        let trimmed_start = line.trim_start();
+        if !trimmed_start.starts_with('-')
+            && !trimmed_start.starts_with('<')
+            && !trimmed_start.starts_with('[')
+        {
+            continue;
+        }
+        assert_eq!(
+            line,
+            line.trim_end(),
+            "{context} help has a blank description for {line:?}"
+        );
+    }
 }
