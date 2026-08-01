@@ -193,7 +193,7 @@ post_switch = [
 on_failure = []
 
 [ui]
-accent = "#cba6f7"
+# accent = "#cba6f7"
 graph_depth = 12
 refresh_ms = 500
 verbose_backend = false

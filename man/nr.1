@@ -1,4 +1,4 @@
-.TH NR 1 "August 2026" "nr 0.3.2" "User Commands"
+.TH NR 1 "August 2026" "nr 0.3.4" "User Commands"
 .SH NAME
 nr \- Git-aware NixOS lifecycle helper
 .SH SYNOPSIS
@@ -240,7 +240,7 @@ Custom checks and hooks are argv arrays, not shell strings.
 post_switch = [["systemctl", "--user", "restart", "waybar.service"]]
 
 [ui]
-accent = "#cba6f7"
+# accent = "#cba6f7"
 graph_depth = 12
 refresh_ms = 500
 verbose_backend = false
@@ -259,7 +259,8 @@ hooks run only after successful activation. Their failures are reported as
 warnings and do not turn the switch, test, boot, or apply result into a failure.
 .PP
 .B accent
-sets the rich/nom UI accent color. It must be a six-digit hex color.
+sets the rich/nom UI accent color when configured. If unset, nr uses the
+terminal's normal foreground color. It must be a six-digit hex color.
 .SH JSON OUTPUT
 .B --ui json
 prints one final report object containing command, target, result, store_path,

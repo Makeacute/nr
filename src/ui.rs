@@ -349,7 +349,7 @@ impl Renderer {
                 accent.red, accent.green, accent.blue
             )
         } else {
-            format!("\x1b[1;36m{text}\x1b[0m")
+            text.to_string()
         }
     }
 
@@ -785,7 +785,9 @@ mod tests {
 
     use crate::events::{Activity, ActivityStatus, BuildCategory, BuildState};
 
-    use super::{OutputMode, build_graph_lines, should_print_backend_line, truncate_line};
+    use super::{
+        OutputMode, Renderer, build_graph_lines, should_print_backend_line, truncate_line,
+    };
 
     #[test]
     fn auto_uses_nom_for_interactive_lifecycle_builds() {
@@ -814,6 +816,16 @@ mod tests {
         assert_eq!(
             OutputMode::Json.effective_for_lifecycle_with_terminal("switch", true),
             OutputMode::Json
+        );
+    }
+
+    #[test]
+    fn unset_accent_uses_terminal_foreground() {
+        let renderer = Renderer::new(OutputMode::Rich);
+
+        assert_eq!(
+            renderer.accent_line("▶ evaluating/building"),
+            "▶ evaluating/building"
         );
     }
 
