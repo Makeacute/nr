@@ -127,14 +127,18 @@ Forward the
 privilege-elevation method used by dry activation, activation, and rollback.
 .TP
 .B --ask-elevate-password
-Force an elevation-password prompt. This is already the default for
-interactive non-root
+Prompt locally and pipe an elevation password to
+.BR nixos-rebuild .
+Interactive non-root
 .BR switch ,
 .BR test ,
 .BR boot ,
 and
 .B rollback
-when no elevation option is supplied.
+use
+.B --elevate sudo
+by default, so sudo normally owns the password prompt. This flag is mainly for
+remote or non-TTY elevation flows.
 .TP
 .B --notify
 Send a desktop notification when lifecycle commands finish. If

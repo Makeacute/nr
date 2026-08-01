@@ -62,6 +62,7 @@ pub fn nixos_rebuild_dry_activate_command(
         "dry-activate".to_string(),
         "--store-path".to_string(),
         store_path.display().to_string(),
+        "--no-reexec".to_string(),
     ];
     args.extend(nix_common_args(options));
     args.extend(nixos_rebuild_elevation_args(options));
@@ -78,6 +79,7 @@ pub fn nixos_rebuild_activate_command(
         action.to_string(),
         "--store-path".to_string(),
         store_path.display().to_string(),
+        "--no-reexec".to_string(),
     ];
     args.extend(nix_common_args(options));
     args.extend(nixos_rebuild_elevation_args(options));
@@ -134,7 +136,11 @@ pub fn nix_flake_update_command(
 }
 
 pub fn rollback_command(options: &BackendOptions) -> CommandSpec {
-    let mut args = vec!["switch".to_string(), "--rollback".to_string()];
+    let mut args = vec![
+        "switch".to_string(),
+        "--rollback".to_string(),
+        "--no-reexec".to_string(),
+    ];
     args.extend(nix_common_args(options));
     args.extend(nixos_rebuild_elevation_args(options));
     args.extend(passthrough_args(&options.backend_args));
@@ -146,6 +152,7 @@ pub fn rollback_to_store_path_command(store_path: &Path, options: &BackendOption
         "switch".to_string(),
         "--store-path".to_string(),
         store_path.display().to_string(),
+        "--no-reexec".to_string(),
     ];
     args.extend(nix_common_args(options));
     args.extend(nixos_rebuild_elevation_args(options));

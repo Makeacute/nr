@@ -49,7 +49,7 @@ fn rollback_is_official_previous_generation_only() {
     let command = rollback_command(&BackendOptions::default());
     assert_eq!(
         command.to_vec(),
-        ["nixos-rebuild", "switch", "--rollback"].map(String::from)
+        ["nixos-rebuild", "switch", "--rollback", "--no-reexec",].map(String::from)
     );
 }
 
@@ -66,6 +66,7 @@ fn rollback_to_generation_uses_store_path_activation() {
             "switch",
             "--store-path",
             "/nix/var/nix/profiles/system-41-link",
+            "--no-reexec",
         ]
         .map(String::from)
     );
@@ -113,6 +114,7 @@ fn activation_commands_forward_elevation_options() {
             "dry-activate",
             "--store-path",
             "/new-system",
+            "--no-reexec",
             "--elevate",
             "sudo",
             "--ask-elevate-password",
@@ -128,6 +130,7 @@ fn activation_commands_forward_elevation_options() {
             "switch",
             "--store-path",
             "/new-system",
+            "--no-reexec",
             "--elevate",
             "sudo",
             "--ask-elevate-password",

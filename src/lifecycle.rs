@@ -798,14 +798,25 @@ fn rollback_backend_options(cli: &Cli, backend_args: &[String]) -> backend::Back
 }
 
 fn apply_default_elevation(action: &str, preview: bool, options: &mut backend::BackendOptions) {
-    if should_apply_default_elevation(
+    apply_default_elevation_with_context(
         action,
         preview,
         options,
         std::io::stdin().is_terminal(),
         running_as_root(),
-    ) {
-        options.ask_elevate_password = true;
+    );
+}
+
+fn apply_default_elevation_with_context(
+    action: &str,
+    preview: bool,
+    options: &mut backend::BackendOptions,
+    stdin_interactive: bool,
+    running_as_root: bool,
+) {
+    if should_apply_default_elevation(action, preview, options, stdin_interactive, running_as_root)
+    {
+        options.elevate = Some("sudo".to_string());
     }
 }
 
@@ -907,11 +918,11 @@ fn failure_report(
 
 #[cfg(test)]
 mod tests {
-    use super::should_apply_default_elevation;
+    use super::{apply_default_elevation_with_context, should_apply_default_elevation};
     use crate::backend::BackendOptions;
 
     #[test]
-    fn mutating_interactive_user_gets_default_password_elevation() {
+    fn mutating_interactive_user_gets_default_sudo_elevation() {
         assert!(should_apply_default_elevation(
             "switch",
             false,
@@ -919,10 +930,14 @@ mod tests {
             true,
             false,
         ));
+        let mut options = BackendOptions::default();
+        apply_default_elevation_with_context("switch", false, &mut options, true, false);
+        assert_eq!(options.elevate.as_deref(), Some("sudo"));
+        assert!(!options.ask_elevate_password);
     }
 
     #[test]
-    fn preview_root_and_explicit_elevation_skip_default_password_elevation() {
+    fn preview_root_and_explicit_elevation_skip_default_sudo_elevation() {
         assert!(!should_apply_default_elevation(
             "switch",
             true,

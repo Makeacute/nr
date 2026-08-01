@@ -49,11 +49,11 @@ is defensive: unknown fields are ignored and malformed internal JSON falls back
 to plain backend log filtering.
 
 When `switch`, `test`, `boot`, or `rollback` is run by a non-root user from an
-interactive terminal, no extra flag is needed: `nr` asks `nixos-rebuild` to
-prompt for elevation. Use `--elevate sudo`, `--elevate run0`, or `--elevate
-none` only when you want to choose a method explicitly. `preview` stays
-non-mutating; if you want its dry-activation probe to authenticate, run `nr
-preview --ask-elevate-password`.
+interactive terminal, no extra flag is needed: `nr` passes `--elevate sudo`,
+so sudo prompts normally. Use `--elevate run0` or `--elevate none` only when
+you want to choose a different method explicitly. `--ask-elevate-password`
+makes `nixos-rebuild` prompt and pipe a password to the elevation method; it is
+mainly useful for remote or non-TTY elevation flows.
 
 Output modes:
 
@@ -66,7 +66,7 @@ Output modes:
 --ui json               Final structured report as JSON
 --log-file PATH         Capture the full backend log at PATH
 --elevate METHOD        Forward nixos-rebuild elevation method: none, sudo, run0
---ask-elevate-password  Force elevation prompt; default for interactive switch/test/boot/rollback
+--ask-elevate-password  Prompt and pipe an elevation password instead of using sudo's prompt
 --notify                Send notify-send notification when lifecycle commands finish
 ```
 

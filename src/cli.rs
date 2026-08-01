@@ -79,7 +79,7 @@ pub struct Cli {
         long,
         visible_alias = "ask-sudo-password",
         global = true,
-        help = "Force an elevation password prompt; default for interactive switch/test/boot/rollback"
+        help = "Prompt and pipe an elevation password instead of letting sudo prompt normally"
     )]
     pub ask_elevate_password: bool,
     #[arg(

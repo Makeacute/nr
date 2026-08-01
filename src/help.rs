@@ -51,7 +51,7 @@ COMMON FLAGS
   --offline                Forward offline mode to Nix.
   --show-trace             Forward Nix traces.
   --elevate none|sudo|run0 Forward nixos-rebuild elevation method.
-  --ask-elevate-password   Force elevation prompt; default for interactive switch/test/boot/rollback.
+  --ask-elevate-password   Prompt and pipe an elevation password instead of using sudo's prompt.
   --notify                 Send a desktop notification when lifecycle commands finish.
   --specialisation NAME    Build or activate a specialisation.
   --                       Pass remaining arguments directly to the backend.
