@@ -29,7 +29,8 @@ nr history              Show bounded switch/test/boot history
 nr logs                 List retained logs and reports
 nr show-report [REPORT] Print a retained lifecycle report
 nr inputs               Inspect or update flake inputs
-nr init-config          Create a starter .nr.toml
+nr init-config          Create a starter repo .nr.toml
+nr init-config --user   Create ~/.config/nr/config.toml
 nr completions SHELL    Generate shell completions
 nr update               Update flake.lock only
 nr update nixpkgs       Update one flake input

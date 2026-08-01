@@ -34,7 +34,8 @@ UPDATES AND CHECKS
   nr check                 Run configured checks. Default: nix flake check.
   nr check --all           Also run nixfmt, statix, cargo fmt, and clippy.
   nr doctor                Show target, config, dependency, and Git diagnostics.
-  nr init-config           Create a starter .nr.toml.
+  nr init-config           Create a starter repo .nr.toml.
+  nr init-config --user    Create ~/.config/nr/config.toml.
   nr completions bash      Generate shell completions.
 
 PUBLISHING

@@ -155,7 +155,7 @@ pub enum NrCommand {
     ShowReport(ShowReportArgs),
     #[command(about = "Inspect or update flake inputs")]
     Inputs(InputsArgs),
-    #[command(about = "Create a starter nr config")]
+    #[command(about = "Create a starter repo or user nr config")]
     InitConfig(InitConfigArgs),
     #[command(about = "Generate shell completions")]
     Completions(CompletionArgs),

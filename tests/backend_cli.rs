@@ -377,6 +377,13 @@ fn generated_help_has_no_blank_descriptions() {
     }
 }
 
+#[test]
+fn generated_help_mentions_user_config_init() {
+    let help = Cli::command().render_long_help().to_string();
+
+    assert!(help.contains("starter repo or user nr config"));
+}
+
 fn assert_no_blank_help_descriptions(context: &str, help: &str) {
     for line in help.lines() {
         let trimmed_start = line.trim_start();
