@@ -80,6 +80,7 @@ case "${1:-}" in
       exit 55
     fi
     echo "would restart the following units: sshd.service display-manager.service"
+    echo "warning: user services are not handled by this dry activation"
     ;;
   switch|test|boot)
     if [ "${NR_FAKE_ACTIVATE_FAIL:-0}" = 1 ]; then

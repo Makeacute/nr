@@ -30,7 +30,7 @@ UPDATES AND CHECKS
   nr update                Update flake.lock only.
   nr update nixpkgs        Update one flake input.
   nr update --switch       Update flake.lock, then build and activate.
-  nr inputs                Inspect flake inputs.
+  nr inputs                Inspect or update flake inputs.
   nr check                 Run configured checks. Default: nix flake check.
   nr check --all           Also run nixfmt, statix, cargo fmt, and clippy.
   nr doctor                Show target, config, dependency, and Git diagnostics.

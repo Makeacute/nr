@@ -1,6 +1,8 @@
 mod support;
 
+use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn preview_builds_diffs_and_dry_activates_without_switching() {
@@ -292,6 +294,8 @@ fn json_ui_outputs_structured_report() {
             "json",
             "--log-file",
             nr_log.to_str().unwrap(),
+            "--target-host",
+            "root@remote",
             "preview",
         ])
         .output()
@@ -307,9 +311,21 @@ fn json_ui_outputs_structured_report() {
     assert_eq!(report["command"], "preview");
     assert_eq!(report["target"], format!("{}#host", flake.path().display()));
     assert!(report["diff"]["upgrades"].as_u64().is_some());
+    assert_eq!(report["diff"]["changes"], 0);
     assert!(report["diff"]["important"].as_array().is_some());
+    assert_eq!(
+        report["diff"]["size_delta"],
+        "closure size: 1.0 GiB -> 1.1 GiB, +100.0 MiB"
+    );
+    assert!(report["diff"]["unavailable"].is_null());
     assert!(
         !report["activation"]["restarted"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !report["activation"]["caveats"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -1169,5 +1185,21 @@ fn failed_build_preserves_backend_exit_code() {
 }
 
 fn nr_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_nr"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nr"));
+    let xdg_config = unique_test_path("config");
+    let xdg_state = unique_test_path("state");
+    std::fs::create_dir_all(&xdg_config).expect("create XDG config dir");
+    std::fs::create_dir_all(&xdg_state).expect("create XDG state dir");
+    command
+        .env("XDG_CONFIG_HOME", xdg_config)
+        .env("XDG_STATE_HOME", xdg_state);
+    command
+}
+
+fn unique_test_path(kind: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("nr-test-{kind}-{}-{nanos}", std::process::id()))
 }

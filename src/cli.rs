@@ -147,13 +147,13 @@ pub enum NrCommand {
     Unpin(UnpinArgs),
     #[command(about = "List pinned generations and stale pin state")]
     Pins(PinsArgs),
-    #[command(about = "Show recorded switch history")]
+    #[command(about = "Show recorded switch, test, and boot history")]
     History(HistoryArgs),
     #[command(about = "List retained logs and reports")]
     Logs(LogsArgs),
     #[command(about = "Print a retained lifecycle report")]
     ShowReport(ShowReportArgs),
-    #[command(about = "Inspect flake inputs")]
+    #[command(about = "Inspect or update flake inputs")]
     Inputs(InputsArgs),
     #[command(about = "Create a starter nr config")]
     InitConfig(InitConfigArgs),

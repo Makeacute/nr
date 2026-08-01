@@ -259,7 +259,10 @@ impl Renderer {
                     "removals": diff.removals.len(),
                     "upgrades": diff.upgrades.len(),
                     "downgrades": diff.downgrades.len(),
-                    "unavailable": diff.unavailable,
+                    "changes": diff.changes.len(),
+                    "important": &diff.important,
+                    "size_delta": &diff.size_delta,
+                    "unavailable": &diff.unavailable,
                 })
             ),
             OutputMode::Raw => {
@@ -288,7 +291,8 @@ impl Renderer {
                     "restarted": activation.restarted,
                     "reloaded": activation.reloaded,
                     "failed": activation.failed,
-                    "unavailable": activation.unavailable,
+                    "caveats": &activation.caveats,
+                    "unavailable": &activation.unavailable,
                 })
             ),
             OutputMode::Raw => {
@@ -420,7 +424,7 @@ fn build_graph_lines_with_depth(
     width: usize,
     graph_depth: usize,
 ) -> Vec<String> {
-    let width = width.clamp(48, 180);
+    let width = width.min(180);
     let phase = if state.phase.is_empty() {
         "building"
     } else {
@@ -732,7 +736,10 @@ pub fn report_value(report: &RebuildReport) -> serde_json::Value {
             "removals": diff.removals.len(),
             "upgrades": diff.upgrades.len(),
             "downgrades": diff.downgrades.len(),
-            "important": diff.important,
+            "changes": diff.changes.len(),
+            "important": &diff.important,
+            "size_delta": &diff.size_delta,
+            "unavailable": &diff.unavailable,
         })
     });
     let activation = report.activation.as_ref().map(|activation| {
@@ -743,7 +750,8 @@ pub fn report_value(report: &RebuildReport) -> serde_json::Value {
             "reloaded": activation.reloaded,
             "skipped": activation.skipped,
             "failed": activation.failed,
-            "unavailable": activation.unavailable,
+            "caveats": &activation.caveats,
+            "unavailable": &activation.unavailable,
         })
     });
 
@@ -913,6 +921,22 @@ digraph G {
         assert!(narrow.iter().all(|line| line.chars().count() <= 48));
         assert!(wide.iter().all(|line| line.chars().count() <= 120));
         assert_ne!(narrow, wide);
+    }
+
+    #[test]
+    fn graph_lines_fit_forty_column_terminal() {
+        let state = BuildState {
+            phase: "building".to_string(),
+            completed: 12,
+            downloads: 2,
+            source_builds: 1,
+            binary_substitutes: 8,
+            ..BuildState::default()
+        };
+
+        let lines = build_graph_lines(&state, 40);
+
+        assert!(lines.iter().all(|line| line.chars().count() <= 40));
     }
 
     #[test]

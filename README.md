@@ -4,8 +4,9 @@
 `nixos-rebuild`, parses Nix internal JSON build events itself, explains closure
 and activation impact, and exits with the real backend status code.
 
-The default v2 direction keeps rebuild rendering inside `nr`; `--ui nom`
-is available for users who want the `nix-output-monitor` build tree.
+The default interactive lifecycle UI uses `nom` for users who want the
+`nix-output-monitor` build tree. Use `--ui rich` to keep the live rebuild graph
+inside `nr`.
 Rollback avoids manual profile editing.
 
 ## Commands
@@ -42,8 +43,8 @@ man nr                  Show the installed manual page
 
 ## Rebuild UI
 
-Lifecycle commands use a bounded command UI rather than a full-screen TUI.
-During a build, `nr` reads
+Lifecycle commands use bounded command output rather than a full-screen TUI.
+In `--ui rich`, `nr` reads
 `nixos-rebuild build --log-format internal-json --verbose`, tracks
 active/completed/failed build activities, groups derivations by broad system
 category, loads derivation edges with `nix-store --query --graph`, and repaints
@@ -120,7 +121,10 @@ and `diff` builds.
     "removals": 0,
     "upgrades": 3,
     "downgrades": 0,
-    "important": ["linux: 6.18.39 -> 6.18.40"]
+    "changes": 0,
+    "important": ["linux: 6.18.39 -> 6.18.40"],
+    "size_delta": "closure size: 1.0 GiB -> 1.1 GiB, +100.0 MiB",
+    "unavailable": null
   },
   "activation": {
     "stopped": [],
@@ -129,6 +133,7 @@ and `diff` builds.
     "reloaded": [],
     "skipped": [],
     "failed": [],
+    "caveats": [],
     "unavailable": null
   }
 }

@@ -1,4 +1,4 @@
-.TH NR 1 "August 2026" "nr 0.3.1" "User Commands"
+.TH NR 1 "August 2026" "nr 0.3.2" "User Commands"
 .SH NAME
 nr \- Git-aware NixOS lifecycle helper
 .SH SYNOPSIS
@@ -262,6 +262,10 @@ sets the rich/nom UI accent color. It must be a six-digit hex color.
 prints one final report object containing command, target, result, store_path,
 current_generation, new_generation, reboot, rollback, log_path, build, diff,
 and activation fields.
+.PP
+The diff object includes additions, removals, upgrades, downgrades, other
+changes, important items, size_delta, and unavailable. The activation object
+includes unit groups, caveats, and unavailable.
 .SH ERROR MODEL
 Build failures stop before activation and preserve the backend exit code.
 Dry-activation failures are fatal for

@@ -137,7 +137,20 @@ fn command_exists(name: &str) -> bool {
 }
 
 fn executable_exists(path: &Path) -> bool {
-    path.is_file()
+    path.is_file() && has_execute_permission(path)
+}
+
+#[cfg(unix)]
+fn has_execute_permission(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn has_execute_permission(_path: &Path) -> bool {
+    true
 }
 
 fn tool_version(name: &str) -> String {
@@ -153,4 +166,28 @@ fn tool_version(name: &str) -> String {
         }
     }
     format!("{name} installed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executable_exists;
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_exists_requires_execute_permission() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tool");
+        fs::write(&path, "#!/bin/sh\n").expect("write tool");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("remove execute permission");
+        assert!(!executable_exists(&path));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("add execute permission");
+        assert!(executable_exists(&path));
+    }
 }
