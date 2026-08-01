@@ -1,12 +1,19 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use crate::backend;
-use crate::cli::{Cli, DiffArgs, GcArgs, RollbackArgs, UpdateArgs};
+use crate::cli::{
+    ApplyArgs, Cli, DiffArgs, GcArgs, HistoryArgs, LifecycleArgs, LogsArgs, RollbackArgs,
+    ShowReportArgs, UpdateArgs,
+};
 use crate::config::{
     FlakeTarget, HookCommand, NrConfig, load_config, split_flake_reference, validate_flake_path,
 };
@@ -17,18 +24,27 @@ use crate::generations::{
     load_pins, load_system_generations, previous_generation, resolve_generation_reference,
     rollback_target_command,
 };
-use crate::git::{ensure_git_flake_visible, git_summary};
+use crate::git::{current_revision, ensure_git_flake_visible, git_command, git_summary};
 use crate::impact::{
-    ActivationImpact, ClosureDiff, current_generation, current_generation_info,
-    diff_current_to_new, parse_activation_impact, parse_closure_diff, reboot_recommendation,
-    resolve_result_link,
+    ActivationImpact, ClosureDiff, current_generation, current_generation_info_for_options,
+    current_system_path_for_options, diff_current_to_new, parse_activation_impact,
+    parse_closure_diff, reboot_recommendation, resolve_result_link,
 };
 use crate::process::{
     CommandSpec, LogFile, RunOutput, StreamEvent, StreamLine, run_capture, run_capture_interactive,
-    run_inherit, stream_command, stream_command_events, stream_command_to_command,
+    run_capture_timeout, run_inherit, stream_command, stream_command_events,
+    stream_command_to_command,
 };
 use crate::prompts::confirm;
-use crate::ui::{OutputMode, RebuildHeader, RebuildReport, Renderer};
+use crate::state;
+use crate::ui::{OutputMode, RebuildHeader, RebuildReport, Renderer, report_value};
+
+pub fn run_lifecycle_command(action: &str, cli: &Cli, args: &LifecycleArgs) -> Result<i32> {
+    if let Some(plan) = &args.from_plan {
+        return run_lifecycle_from_plan(action, cli, plan, &args.backend_args);
+    }
+    run_lifecycle(action, cli, &args.backend_args)
+}
 
 pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result<i32> {
     let config = load_config(cli.config_input())?;
@@ -36,17 +52,22 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
 
     let preview = action == "preview" || cli.dry;
     let command_name = if preview { "preview" } else { action };
-    let options = lifecycle_backend_options(action, preview, cli, backend_args);
-    let mut log = LogFile::create(cli.log_file.clone())?;
-    let mut renderer = Renderer::new_for_lifecycle(cli.ui, command_name, config.ui.accent.clone());
+    let options = lifecycle_backend_options(action, preview, cli, &config, backend_args);
+    let mut log = LogFile::create_with_limit(cli.log_file.clone(), config.state.keep_logs)?;
+    let mut renderer = Renderer::new_for_lifecycle(cli.ui, command_name, config.ui.clone());
     let header = RebuildHeader {
         command: command_name.to_string(),
         target: config.target.clone(),
         git: git_summary(&config.target.path),
-        current: current_generation_info(),
+        current: current_generation_info_for_options(&options),
         log_path: log.path().to_path_buf(),
     };
     renderer.start(&header);
+
+    if !config.hooks.pre_build.is_empty() {
+        renderer.phase("pre-build hooks");
+        run_hook_phase("pre_build", &config, None, &mut log, &mut renderer)?;
+    }
 
     let _temp_dir;
     let build_cwd = if action == "build" && !preview {
@@ -86,6 +107,8 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
             build.state,
         );
         finish_lifecycle(cli, &mut renderer, &report, false);
+        persist_report_state(&config, &report, false)?;
+        run_failure_hooks(&config, &mut log, &mut renderer, "build failed")?;
         log.flush()?;
         return Err(NrError::CommandFailed {
             command: build_command.render(),
@@ -95,6 +118,16 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
     let build_state = build.state;
 
     let store_path = resolve_result_link(&build_cwd)?;
+    if !config.hooks.post_build.is_empty() {
+        renderer.phase("post-build hooks");
+        run_hook_phase(
+            "post_build",
+            &config,
+            Some(&store_path),
+            &mut log,
+            &mut renderer,
+        )?;
+    }
     renderer.phase("diffing");
     let diff =
         diff_current_to_new(&store_path, &options, &mut log).unwrap_or_else(|error| ClosureDiff {
@@ -129,6 +162,7 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
             build_state,
         );
         finish_lifecycle(cli, &mut renderer, &report, true);
+        persist_success_state(&config, &header, &report, &options, preview)?;
         log.flush()?;
         return Ok(0);
     }
@@ -158,11 +192,22 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
             build_state,
         );
         finish_lifecycle(cli, &mut renderer, &report, true);
+        persist_report_state(&config, &report, true)?;
         log.flush()?;
         return Ok(0);
     }
 
     let activation_command = backend::nixos_rebuild_activate_command(action, &store_path, &options);
+    if !config.hooks.pre_activate.is_empty() {
+        renderer.phase("pre-activate hooks");
+        run_hook_phase(
+            "pre_activate",
+            &config,
+            Some(&store_path),
+            &mut log,
+            &mut renderer,
+        )?;
+    }
     log.write_command(&activation_command)?;
     let code = stream_activation_command(&activation_command, &options, &mut log, &mut renderer)?;
     if code != 0 {
@@ -179,6 +224,8 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
             build_state,
         );
         finish_lifecycle(cli, &mut renderer, &report, false);
+        persist_report_state(&config, &report, false)?;
+        run_failure_hooks(&config, &mut log, &mut renderer, "activation failed")?;
         log.flush()?;
         return Err(NrError::CommandFailed {
             command: activation_command.render(),
@@ -186,33 +233,32 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
         });
     }
 
-    if action == "switch" && !config.hooks.post_switch.is_empty() {
-        renderer.phase("post-switch hooks");
-        if let Err(error) = run_post_switch_hooks(
-            &config.hooks.post_switch,
-            &config.target.path,
+    let mut hook_warnings = Vec::new();
+    if !config.hooks.post_activate.is_empty() {
+        renderer.phase("post-activate hooks");
+        run_nonfatal_hook_phase(
+            "post_activate",
+            &config,
+            Some(&store_path),
             &mut log,
             &mut renderer,
-        ) {
-            let report = failure_report(
-                ReportContext {
-                    command_name,
-                    config: &config,
-                    header: &header,
-                },
-                "post-switch hook failed",
-                Some(store_path),
-                Some(diff),
-                activation,
-                build_state,
-            );
-            finish_lifecycle(cli, &mut renderer, &report, false);
-            log.flush()?;
-            return Err(error);
-        }
+            &mut hook_warnings,
+        )?;
     }
 
-    let report = success_report(
+    if action == "switch" && !config.hooks.post_switch.is_empty() {
+        renderer.phase("post-switch hooks");
+        run_nonfatal_hook_phase(
+            "post_switch",
+            &config,
+            Some(&store_path),
+            &mut log,
+            &mut renderer,
+            &mut hook_warnings,
+        )?;
+    }
+
+    let mut report = success_report(
         ReportContext {
             command_name,
             config: &config,
@@ -224,27 +270,260 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
         current_generation(),
         build_state,
     );
+    apply_hook_warnings(&mut report, &hook_warnings);
     finish_lifecycle(cli, &mut renderer, &report, true);
+    persist_success_state(&config, &header, &report, &options, preview)?;
     log.flush()?;
     Ok(0)
 }
 
 pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32> {
     ensure_git_flake_visible(&config.target.path)?;
-    let options = cli.backend_options(&[]);
+    let lockfile_snapshot = if args.revert_on_failure {
+        Some(LockfileSnapshot::capture(&config.target.path)?)
+    } else {
+        None
+    };
+    let options = cli.backend_options_with_config(config, &[]);
     let command = backend::nix_flake_update_command(&config.target, &args.inputs, &options);
     let code = run_inherit(&command, true)?;
     if code != 0 {
+        restore_lockfile_after_failure(lockfile_snapshot.as_ref());
         return Err(NrError::CommandFailed {
             command: command.render(),
             code,
         });
     }
+    show_lockfile_diff(&config.target.path)?;
     if args.switch {
-        run_lifecycle("switch", cli, &[])
+        match run_lifecycle("switch", cli, &[]) {
+            Ok(code) => Ok(code),
+            Err(error) => {
+                restore_lockfile_after_failure(lockfile_snapshot.as_ref());
+                Err(error)
+            }
+        }
     } else {
         Ok(0)
     }
+}
+
+fn show_lockfile_diff(flake_path: &Path) -> Result<()> {
+    if !flake_path.join(".git").exists() {
+        return Ok(());
+    }
+    let status = run_capture(
+        &git_command(flake_path, &["status", "--short", "--", "flake.lock"]),
+        false,
+    )?;
+    if status.stdout.trim().is_empty() {
+        return Ok(());
+    }
+    println!("flake.lock changed:");
+    let code = run_inherit(
+        &git_command(flake_path, &["--no-pager", "diff", "--", "flake.lock"]),
+        true,
+    )?;
+    if code != 0 {
+        eprintln!("warning: git diff exited with {code}");
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct LockfileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl LockfileSnapshot {
+    fn capture(flake_path: &Path) -> Result<Self> {
+        let path = flake_path.join("flake.lock");
+        let contents = match fs::read(&path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(NrError::Io {
+                    context: format!("failed to read {}", path.display()),
+                    source,
+                });
+            }
+        };
+        Ok(Self { path, contents })
+    }
+
+    fn restore(&self) -> Result<()> {
+        match &self.contents {
+            Some(contents) => fs::write(&self.path, contents).map_err(|source| NrError::Io {
+                context: format!("failed to restore {}", self.path.display()),
+                source,
+            }),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(NrError::Io {
+                    context: format!("failed to remove {}", self.path.display()),
+                    source,
+                }),
+            },
+        }
+    }
+}
+
+fn restore_lockfile_after_failure(snapshot: Option<&LockfileSnapshot>) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    match snapshot.restore() {
+        Ok(()) => eprintln!("reverted flake.lock to its pre-update state"),
+        Err(error) => eprintln!("warning: failed to revert flake.lock: {error}"),
+    }
+}
+
+pub fn run_apply(cli: &Cli, args: &ApplyArgs) -> Result<i32> {
+    run_lifecycle_from_plan(args.action.as_str(), cli, &args.plan, &args.backend_args)
+}
+
+fn run_lifecycle_from_plan(
+    action: &str,
+    cli: &Cli,
+    plan_reference: &str,
+    backend_args: &[String],
+) -> Result<i32> {
+    let plan_path = state::resolve_json_reference(&state::plans_dir(), "plan", plan_reference)?;
+    let plan_text = fs::read_to_string(&plan_path).map_err(|source| NrError::Io {
+        context: format!("failed to read {}", plan_path.display()),
+        source,
+    })?;
+    let plan: PreviewPlan = serde_json::from_str(&plan_text)
+        .map_err(|error| NrError::message(format!("failed to parse preview plan: {error}")))?;
+    let mut config = load_config(cli.config_input())?;
+    config.target = FlakeTarget {
+        path: plan.target.path.clone(),
+        host: plan.target.host.clone(),
+    };
+    let mut options = backend_options_for_plan(cli, &config, backend_args, &plan.backend_options);
+    apply_default_elevation(action, false, &mut options);
+
+    let mut log = LogFile::create_with_limit(cli.log_file.clone(), config.state.keep_logs)?;
+    let mut renderer = Renderer::new_for_lifecycle(cli.ui, action, config.ui.clone());
+    let header = RebuildHeader {
+        command: action.to_string(),
+        target: config.target.clone(),
+        git: git_summary(&config.target.path),
+        current: current_generation_info_for_options(&options),
+        log_path: log.path().to_path_buf(),
+    };
+    renderer.start(&header);
+    renderer.phase("using saved preview plan");
+    log.write_line(
+        crate::process::StreamSource::Stdout,
+        &format!("using preview plan {}", plan_path.display()),
+    )?;
+
+    let diff = diff_current_to_new(&plan.store_path, &options, &mut log).unwrap_or_else(|error| {
+        ClosureDiff {
+            unavailable: Some(error.to_string()),
+            ..ClosureDiff::default()
+        }
+    });
+    renderer.diff(&diff);
+
+    let mut activation = None;
+    if matches!(action, "switch" | "test") {
+        renderer.phase("dry activation");
+        activation = Some(run_dry_activation(
+            &plan.store_path,
+            &options,
+            &mut log,
+            &mut renderer,
+            true,
+        )?);
+    }
+
+    let mut hook_warnings = Vec::new();
+    if action == "boot" {
+        renderer.phase("boot registration");
+    } else {
+        renderer.phase("activation");
+    }
+    if !config.hooks.pre_activate.is_empty() {
+        renderer.phase("pre-activate hooks");
+        run_hook_phase(
+            "pre_activate",
+            &config,
+            Some(&plan.store_path),
+            &mut log,
+            &mut renderer,
+        )?;
+    }
+    let activation_command =
+        backend::nixos_rebuild_activate_command(action, &plan.store_path, &options);
+    log.write_command(&activation_command)?;
+    let code = stream_activation_command(&activation_command, &options, &mut log, &mut renderer)?;
+    if code != 0 {
+        let report = failure_report(
+            ReportContext {
+                command_name: action,
+                config: &config,
+                header: &header,
+            },
+            "activation failed",
+            Some(plan.store_path),
+            Some(diff),
+            activation,
+            BuildState::default(),
+        );
+        finish_lifecycle(cli, &mut renderer, &report, false);
+        persist_report_state(&config, &report, false)?;
+        run_failure_hooks(&config, &mut log, &mut renderer, "activation failed")?;
+        log.flush()?;
+        return Err(NrError::CommandFailed {
+            command: activation_command.render(),
+            code,
+        });
+    }
+
+    if !config.hooks.post_activate.is_empty() {
+        renderer.phase("post-activate hooks");
+        run_nonfatal_hook_phase(
+            "post_activate",
+            &config,
+            Some(&plan.store_path),
+            &mut log,
+            &mut renderer,
+            &mut hook_warnings,
+        )?;
+    }
+    if action == "switch" && !config.hooks.post_switch.is_empty() {
+        renderer.phase("post-switch hooks");
+        run_nonfatal_hook_phase(
+            "post_switch",
+            &config,
+            Some(&plan.store_path),
+            &mut log,
+            &mut renderer,
+            &mut hook_warnings,
+        )?;
+    }
+
+    let mut report = success_report(
+        ReportContext {
+            command_name: action,
+            config: &config,
+            header: &header,
+        },
+        &plan.store_path,
+        diff,
+        activation,
+        current_generation(),
+        BuildState::default(),
+    );
+    apply_hook_warnings(&mut report, &hook_warnings);
+    finish_lifecycle(cli, &mut renderer, &report, true);
+    persist_success_state(&config, &header, &report, &options, false)?;
+    log.flush()?;
+    Ok(0)
 }
 
 pub fn run_rollback(cli: &Cli, args: &RollbackArgs) -> Result<i32> {
@@ -300,6 +579,127 @@ pub fn run_gc(args: &GcArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn backend_options_for_plan(
+    cli: &Cli,
+    config: &NrConfig,
+    backend_args: &[String],
+    plan_options: &backend::BackendOptions,
+) -> backend::BackendOptions {
+    let cli_options = cli.backend_options_with_config(config, backend_args);
+    let mut options = plan_options.clone();
+
+    if cli.verbose > 0 {
+        options.verbose = cli_options.verbose;
+    }
+    options.offline |= cli_options.offline;
+    options.show_trace |= cli_options.show_trace;
+    if cli.specialisation.is_some() {
+        options.specialisation = cli_options.specialisation;
+    }
+    if cli.elevate.is_some() {
+        options.elevate = cli_options.elevate;
+    }
+    options.ask_elevate_password |= cli_options.ask_elevate_password;
+    if cli.target_host.is_some() || options.target_host.is_none() {
+        options.target_host = cli_options.target_host;
+    }
+    if cli.build_host.is_some() || options.build_host.is_none() {
+        options.build_host = cli_options.build_host;
+    }
+    options.use_remote_sudo |= cli_options.use_remote_sudo;
+    if !backend_args.is_empty() {
+        options.backend_args = cli_options.backend_args;
+    }
+
+    options
+}
+
+pub fn run_history(args: &HistoryArgs) -> Result<i32> {
+    let path = state::history_path();
+    if !path.is_file() {
+        println!("No switch history recorded.");
+        return Ok(0);
+    }
+    let text = fs::read_to_string(&path).map_err(|source| NrError::Io {
+        context: format!("failed to read {}", path.display()),
+        source,
+    })?;
+    let history = serde_json::from_str::<HistoryFile>(&text)
+        .map_err(|error| NrError::message(format!("failed to parse history: {error}")))?;
+    for entry in history.entries.iter().rev().take(args.limit) {
+        println!(
+            "{} {} {} old:{:?} new:{:?} {} log:{}",
+            entry.timestamp,
+            entry.action,
+            entry.target,
+            entry.old_generation,
+            entry.new_generation,
+            entry.report_result,
+            entry.log_path.display()
+        );
+    }
+    Ok(0)
+}
+
+pub fn run_logs(args: &LogsArgs) -> Result<i32> {
+    if args.last_failed {
+        let mut reports = state::sorted_json_files(&state::reports_dir(), "report")?;
+        reports.reverse();
+        for report in reports {
+            let text = fs::read_to_string(&report).map_err(|source| NrError::Io {
+                context: format!("failed to read {}", report.display()),
+                source,
+            })?;
+            let stored = serde_json::from_str::<StoredReport>(&text).map_err(|error| {
+                NrError::message(format!(
+                    "failed to parse report {}: {error}",
+                    report.display()
+                ))
+            })?;
+            if !stored.success {
+                if let Some(log_path) = stored
+                    .report
+                    .get("log_path")
+                    .and_then(|value| value.as_str())
+                {
+                    println!("{log_path}");
+                } else {
+                    println!("{}", report.display());
+                }
+                return Ok(0);
+            }
+        }
+        println!("No failed reports retained.");
+        return Ok(0);
+    }
+
+    for path in state::sorted_log_files()?
+        .into_iter()
+        .rev()
+        .take(args.limit)
+    {
+        println!("{}", path.display());
+    }
+    for path in state::sorted_json_files(&state::reports_dir(), "report")?
+        .into_iter()
+        .rev()
+        .take(args.limit)
+    {
+        println!("{}", path.display());
+    }
+    Ok(0)
+}
+
+pub fn run_show_report(args: &ShowReportArgs) -> Result<i32> {
+    let path = state::resolve_json_reference(&state::reports_dir(), "report", &args.report)?;
+    let text = fs::read_to_string(&path).map_err(|source| NrError::Io {
+        context: format!("failed to read {}", path.display()),
+        source,
+    })?;
+    println!("{text}");
+    Ok(0)
+}
+
 fn print_rollback_target(
     generations: &[crate::generations::SystemGeneration],
     target_generation: Option<u64>,
@@ -349,19 +749,19 @@ fn wait_for_rollback_confirmation() -> Result<()> {
 
 pub fn run_diff(cli: &Cli, args: &DiffArgs) -> Result<i32> {
     let config = load_config(cli.config_input())?;
-    let options = cli.backend_options(&args.backend_args);
-    let mut log = LogFile::create(cli.log_file.clone())?;
-    let mut renderer = Renderer::new_for_lifecycle(cli.ui, "diff", config.ui.accent.clone());
+    let options = cli.backend_options_with_config(&config, &args.backend_args);
+    let mut log = LogFile::create_with_limit(cli.log_file.clone(), config.state.keep_logs)?;
+    let mut renderer = Renderer::new_for_lifecycle(cli.ui, "diff", config.ui.clone());
     let header = RebuildHeader {
         command: "diff".to_string(),
         target: config.target.clone(),
         git: git_summary(&config.target.path),
-        current: current_generation_info(),
+        current: current_generation_info_for_options(&options),
         log_path: log.path().to_path_buf(),
     };
     renderer.start(&header);
 
-    let from = resolve_diff_from(args.from.as_deref())?;
+    let from = resolve_diff_from(args.from.as_deref(), &options)?;
     let to = resolve_diff_to(
         args.to.as_deref(),
         &config.target,
@@ -375,7 +775,7 @@ pub fn run_diff(cli: &Cli, args: &DiffArgs) -> Result<i32> {
 
     let report = RebuildReport {
         command: "diff".to_string(),
-        target: config.target,
+        target: config.target.clone(),
         result: format!("diff complete: {} -> {}", from.label, to.label),
         store_path: Some(to.path),
         current: header.current,
@@ -388,6 +788,7 @@ pub fn run_diff(cli: &Cli, args: &DiffArgs) -> Result<i32> {
         log_path: header.log_path,
     };
     finish_lifecycle(cli, &mut renderer, &report, true);
+    persist_report_state(&config, &report, true)?;
     log.flush()?;
     Ok(0)
 }
@@ -398,7 +799,10 @@ struct DiffEndpoint {
     _temp_dir: Option<tempfile::TempDir>,
 }
 
-fn resolve_diff_from(value: Option<&str>) -> Result<DiffEndpoint> {
+fn resolve_diff_from(
+    value: Option<&str>,
+    options: &backend::BackendOptions,
+) -> Result<DiffEndpoint> {
     if let Some(value) = value {
         let path = generation_or_path(value)?;
         return Ok(DiffEndpoint {
@@ -407,9 +811,17 @@ fn resolve_diff_from(value: Option<&str>) -> Result<DiffEndpoint> {
             _temp_dir: None,
         });
     }
+    let path = current_system_path_for_options(options).ok_or_else(|| {
+        NrError::message("failed to inspect /run/current-system on remote target")
+    })?;
+    let label = if let Some(host) = options.target_host.as_deref() {
+        format!("{host}:/run/current-system")
+    } else {
+        "/run/current-system".to_string()
+    };
     Ok(DiffEndpoint {
-        path: PathBuf::from("/run/current-system"),
-        label: "/run/current-system".to_string(),
+        path,
+        label,
         _temp_dir: None,
     })
 }
@@ -552,6 +964,138 @@ struct BuildRun {
     state: BuildState,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PreviewPlan {
+    id: String,
+    created_at: u64,
+    target: FlakeTargetSnapshot,
+    store_path: PathBuf,
+    log_path: PathBuf,
+    backend_options: backend::BackendOptions,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FlakeTargetSnapshot {
+    path: PathBuf,
+    host: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredReport {
+    success: bool,
+    saved_at: u64,
+    report: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct HistoryFile {
+    entries: Vec<HistoryEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HistoryEntry {
+    timestamp: u64,
+    action: String,
+    target: String,
+    old_generation: Option<u64>,
+    new_generation: Option<u64>,
+    store_path: Option<PathBuf>,
+    git_revision: Option<String>,
+    log_path: PathBuf,
+    report_result: String,
+}
+
+fn persist_success_state(
+    config: &NrConfig,
+    header: &RebuildHeader,
+    report: &RebuildReport,
+    options: &backend::BackendOptions,
+    preview: bool,
+) -> Result<()> {
+    let report_path = persist_report_state(config, report, true)?;
+    if preview {
+        let plan = PreviewPlan {
+            id: format!("plan-{}-{}", state::timestamp(), std::process::id()),
+            created_at: state::timestamp(),
+            target: FlakeTargetSnapshot {
+                path: config.target.path.clone(),
+                host: config.target.host.clone(),
+            },
+            store_path: report
+                .store_path
+                .clone()
+                .ok_or_else(|| NrError::message("cannot save preview plan without a store path"))?,
+            log_path: header.log_path.clone(),
+            backend_options: options.clone(),
+        };
+        let path = state::write_json(&state::plans_dir(), "plan", &plan, config.state.keep_plans)?;
+        eprintln!("preview plan saved: {}", path.display());
+    } else if matches!(report.command.as_str(), "switch" | "test" | "boot") {
+        append_history(config, header, report)?;
+    }
+    eprintln!("report saved: {}", report_path.display());
+    Ok(())
+}
+
+fn persist_report_state(
+    config: &NrConfig,
+    report: &RebuildReport,
+    success: bool,
+) -> Result<PathBuf> {
+    let stored = StoredReport {
+        success,
+        saved_at: state::timestamp(),
+        report: report_value(report),
+    };
+    state::write_json(
+        &state::reports_dir(),
+        "report",
+        &stored,
+        config.state.keep_reports,
+    )
+}
+
+fn append_history(config: &NrConfig, header: &RebuildHeader, report: &RebuildReport) -> Result<()> {
+    let path = state::history_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NrError::Io {
+            context: format!("failed to create {}", parent.display()),
+            source,
+        })?;
+    }
+    let mut history = if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|source| NrError::Io {
+            context: format!("failed to read {}", path.display()),
+            source,
+        })?;
+        serde_json::from_str::<HistoryFile>(&text)
+            .map_err(|error| NrError::message(format!("failed to parse history: {error}")))?
+    } else {
+        HistoryFile::default()
+    };
+    history.entries.push(HistoryEntry {
+        timestamp: state::timestamp(),
+        action: report.command.clone(),
+        target: report.target.reference(),
+        old_generation: header.current.generation,
+        new_generation: report.new_generation,
+        store_path: report.store_path.clone(),
+        git_revision: current_revision(&config.target.path),
+        log_path: header.log_path.clone(),
+        report_result: report.result.clone(),
+    });
+    if history.entries.len() > config.state.keep_history {
+        let remove = history.entries.len() - config.state.keep_history;
+        history.entries.drain(0..remove);
+    }
+    let text = serde_json::to_string_pretty(&history)
+        .map_err(|error| NrError::message(format!("failed to serialize history: {error}")))?;
+    fs::write(&path, text).map_err(|source| NrError::Io {
+        context: format!("failed to write {}", path.display()),
+        source,
+    })
+}
+
 fn stream_nix_build(
     command: &CommandSpec,
     log: &mut LogFile,
@@ -633,23 +1177,38 @@ fn notify_lifecycle(report: &RebuildReport, success: bool) {
     }
 }
 
-fn run_post_switch_hooks(
-    hooks: &[HookCommand],
-    cwd: &Path,
+fn run_hook_phase(
+    phase: &str,
+    config: &NrConfig,
+    store_path: Option<&Path>,
     log: &mut LogFile,
     renderer: &mut Renderer,
 ) -> Result<()> {
+    let hooks = hooks_for_phase(&config.hooks, phase);
     for hook in hooks {
         let Some((program, args)) = hook.split_first() else {
-            return Err(NrError::message(
-                "[hooks].post_switch entries cannot be empty.",
-            ));
+            return Err(NrError::message(format!(
+                "[hooks].{phase} entries cannot be empty."
+            )));
         };
         let command = CommandSpec::new(program.clone())
             .args(args.iter().cloned())
-            .cwd(cwd.to_path_buf());
+            .cwd(config.target.path.to_path_buf())
+            .env("NR_HOOK", phase)
+            .env("NR_TARGET", config.target.reference())
+            .env("NR_FLAKE", config.target.path.display().to_string())
+            .env("NR_HOST", config.target.host.clone())
+            .env("NR_STORE_PATH", path_env(store_path))
+            .env("NR_LOG_FILE", log.path().display().to_string());
         log.write_command(&command)?;
-        let code = stream_plain_command(&command, log, renderer)?;
+        let output = run_capture_timeout(
+            &command,
+            should_announce_backend(renderer),
+            Some(Duration::from_secs(config.hooks.timeout_seconds)),
+        )?;
+        log.write_output(&output)?;
+        render_output_lines(&output, renderer);
+        let code = output.code;
         if code != 0 {
             return Err(NrError::CommandFailed {
                 command: command.render(),
@@ -658,6 +1217,101 @@ fn run_post_switch_hooks(
         }
     }
     Ok(())
+}
+
+fn run_nonfatal_hook_phase(
+    phase: &str,
+    config: &NrConfig,
+    store_path: Option<&Path>,
+    log: &mut LogFile,
+    renderer: &mut Renderer,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    match run_hook_phase(phase, config, store_path, log, renderer) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let warning = format!(
+                "warning: {} failed after successful activation: {error}",
+                hook_phase_label(phase)
+            );
+            log.write_line(crate::process::StreamSource::Stderr, &warning)?;
+            renderer.backend_line(&StreamLine {
+                source: crate::process::StreamSource::Stderr,
+                line: warning.clone(),
+            });
+            warnings.push(warning);
+            Ok(())
+        }
+    }
+}
+
+fn apply_hook_warnings(report: &mut RebuildReport, warnings: &[String]) {
+    if !warnings.is_empty() {
+        report.result = format!(
+            "{}; {} post-activation hook warning(s), see log",
+            report.result,
+            warnings.len()
+        );
+    }
+}
+
+fn hook_phase_label(phase: &str) -> &str {
+    match phase {
+        "post_activate" => "post-activate hook",
+        "post_switch" => "post-switch hook",
+        _ => "hook",
+    }
+}
+
+fn run_failure_hooks(
+    config: &NrConfig,
+    log: &mut LogFile,
+    renderer: &mut Renderer,
+    reason: &str,
+) -> Result<()> {
+    if config.hooks.on_failure.is_empty() {
+        return Ok(());
+    }
+    renderer.phase("failure hooks");
+    if let Err(error) = run_hook_phase("on_failure", config, None, log, renderer) {
+        log.write_line(
+            crate::process::StreamSource::Stderr,
+            &format!("failure hook failed after {reason}: {error}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn hooks_for_phase<'a>(hooks: &'a crate::config::HookSettings, phase: &str) -> &'a [HookCommand] {
+    match phase {
+        "pre_build" => &hooks.pre_build,
+        "post_build" => &hooks.post_build,
+        "pre_activate" => &hooks.pre_activate,
+        "post_activate" => &hooks.post_activate,
+        "post_switch" => &hooks.post_switch,
+        "on_failure" => &hooks.on_failure,
+        _ => &[],
+    }
+}
+
+fn path_env(path: Option<&Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
+fn render_output_lines(output: &RunOutput, renderer: &mut Renderer) {
+    for line in output.stdout.lines() {
+        renderer.backend_line(&StreamLine {
+            source: crate::process::StreamSource::Stdout,
+            line: line.to_string(),
+        });
+    }
+    for line in output.stderr.lines() {
+        renderer.backend_line(&StreamLine {
+            source: crate::process::StreamSource::Stderr,
+            line: line.to_string(),
+        });
+    }
 }
 
 fn should_announce_backend(renderer: &Renderer) -> bool {
@@ -887,9 +1541,10 @@ fn lifecycle_backend_options(
     action: &str,
     preview: bool,
     cli: &Cli,
+    config: &NrConfig,
     backend_args: &[String],
 ) -> backend::BackendOptions {
-    let mut options = cli.backend_options(backend_args);
+    let mut options = cli.backend_options_with_config(config, backend_args);
     apply_default_elevation(action, preview, &mut options);
     options
 }

@@ -203,6 +203,19 @@ pub fn current_branch(flake_path: &Path) -> Result<String> {
     Ok(branch.to_string())
 }
 
+pub fn current_revision(flake_path: &Path) -> Option<String> {
+    let output = run_capture(&git_command(flake_path, &["rev-parse", "HEAD"]), false).ok()?;
+    if output.code != 0 {
+        return None;
+    }
+    let revision = output.stdout.trim();
+    if revision.is_empty() {
+        None
+    } else {
+        Some(revision.to_string())
+    }
+}
+
 pub fn git_summary(flake_path: &Path) -> GitSummary {
     let output = run_capture(
         &git_command(flake_path, &["status", "--porcelain=v2", "--branch", "-z"]),

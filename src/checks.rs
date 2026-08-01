@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use crate::backend::{self, BackendOptions};
 use crate::cli::{CheckArgs, Cli};
 use crate::config::{CheckSettings, NrConfig};
 use crate::errors::{NrError, Result};
-use crate::process::{CommandSpec, RunOutput, render_command, run_capture};
+use crate::process::{CommandSpec, RunOutput, render_command, run_capture_timeout};
 
 const EXCLUDED_DIRECTORIES: &[&str] = &[
     ".cache",
@@ -19,40 +21,106 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[
 
 pub fn run_check(cli: &Cli, config: &NrConfig, args: &CheckArgs) -> Result<i32> {
     let settings = apply_check_overrides(config.check.clone(), args);
-    let checks = configured_checks(&config.target.path, &settings, &cli.backend_options(&[]));
+    let mut checks = configured_checks(
+        &config.target.path,
+        &settings,
+        &cli.backend_options_with_config(config, &[]),
+    );
+    if !args.only.is_empty() {
+        let filters = args
+            .only
+            .iter()
+            .map(|value| value.to_lowercase())
+            .collect::<Vec<_>>();
+        checks.retain(|(name, command)| {
+            let haystack = format!(
+                "{} {}",
+                name.to_lowercase(),
+                command.render().to_lowercase()
+            );
+            filters.iter().any(|filter| haystack.contains(filter))
+        });
+    }
     if checks.is_empty() {
-        println!("No checks enabled.");
+        if args.json {
+            println!("{}", serde_json::json!({"checks": [], "failed": 0}));
+        } else {
+            println!("No checks enabled.");
+        }
         return Ok(0);
     }
 
-    let mut failed = Vec::new();
-    for (name, command) in checks {
-        println!("\n[{name}] {}", command.render());
-        let output = run_capture(&command, false)?;
-        if output.code == 0 {
-            println!("passed");
-        } else {
-            failed.push(CheckFailure {
-                name,
-                command,
-                output,
-            });
+    let timeout = args
+        .timeout
+        .map(|seconds| Duration::from_secs(seconds.max(1)));
+    let mut handles = Vec::new();
+    for (name, command) in checks.into_iter() {
+        if !args.json {
+            println!("\n[{name}] {}", command.render());
         }
+        handles.push(thread::spawn(move || {
+            let output = run_capture_timeout(&command, false, timeout);
+            (name, command, output)
+        }));
     }
 
+    let mut results = Vec::new();
+    for handle in handles {
+        let (name, command, output) = handle
+            .join()
+            .map_err(|_| NrError::message("check worker thread panicked"))?;
+        let output = output?;
+        if !args.json && output.code == 0 {
+            println!("[{name}] passed");
+        }
+        results.push(CheckFailure {
+            name,
+            command,
+            output,
+        });
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "checks": results.iter().map(check_json).collect::<Vec<_>>(),
+                "failed": results.iter().filter(|result| result.output.code != 0).count(),
+            })
+        );
+    }
+
+    let failed = results
+        .into_iter()
+        .filter(|result| result.output.code != 0)
+        .collect::<Vec<_>>();
     if failed.is_empty() {
-        println!("\nAll checks passed.");
+        if !args.json {
+            println!("\nAll checks passed.");
+        }
         Ok(0)
     } else {
-        eprintln!("\nFailed checks:");
-        for failure in &failed {
-            print_check_failure(failure);
+        if !args.json {
+            eprintln!("\nFailed checks:");
+            for failure in &failed {
+                print_check_failure(failure);
+            }
         }
         Err(NrError::CommandFailed {
             command: "nr check".to_string(),
             code: 1,
         })
     }
+}
+
+fn check_json(failure: &CheckFailure) -> serde_json::Value {
+    serde_json::json!({
+        "name": failure.name,
+        "command": failure.command.render(),
+        "code": failure.output.code,
+        "stdout": failure.output.stdout,
+        "stderr": failure.output.stderr,
+    })
 }
 
 struct CheckFailure {

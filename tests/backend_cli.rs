@@ -264,6 +264,50 @@ fn cli_accepts_new_lifecycle_subcommands() {
 }
 
 #[test]
+fn cli_accepts_plan_remote_and_new_utility_commands() {
+    let cli = Cli::parse_from([
+        "nr",
+        "--target-host",
+        "root@host",
+        "--build-host",
+        "builder",
+        "--use-remote-sudo",
+        "switch",
+        "--from-plan",
+        "latest",
+    ])
+    .unwrap();
+    assert_eq!(cli.target_host.as_deref(), Some("root@host"));
+    assert_eq!(cli.build_host.as_deref(), Some("builder"));
+    assert!(cli.use_remote_sudo);
+    let Some(NrCommand::Switch(args)) = cli.command else {
+        panic!("expected switch");
+    };
+    assert_eq!(args.from_plan.as_deref(), Some("latest"));
+
+    assert!(matches!(
+        Cli::parse_from(["nr", "apply", "latest"]).unwrap().command,
+        Some(NrCommand::Apply(_))
+    ));
+    assert!(matches!(
+        Cli::parse_from(["nr", "logs", "--last-failed"])
+            .unwrap()
+            .command,
+        Some(NrCommand::Logs(_))
+    ));
+    assert!(matches!(
+        Cli::parse_from(["nr", "inputs", "--json"]).unwrap().command,
+        Some(NrCommand::Inputs(_))
+    ));
+    assert!(matches!(
+        Cli::parse_from(["nr", "completions", "bash"])
+            .unwrap()
+            .command,
+        Some(NrCommand::Completions(_))
+    ));
+}
+
+#[test]
 fn cli_reports_missing_values() {
     let error = Cli::parse_from(["nr", "--flake"]).unwrap_err().to_string();
 

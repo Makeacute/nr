@@ -1,12 +1,14 @@
 use std::env;
 use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 
 use crate::VERSION;
 use crate::backend::BackendOptions;
-use crate::config::{ConfigInput, load_config};
+use crate::config::{ConfigInput, NrConfig, load_config};
 use crate::errors::{IoContext, NrError, Result};
 use crate::ui::OutputMode;
 
@@ -95,6 +97,22 @@ pub struct Cli {
         help = "Build or activate a NixOS specialisation"
     )]
     pub specialisation: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "HOST",
+        help = "Forward nixos-rebuild --target-host"
+    )]
+    pub target_host: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "HOST",
+        help = "Forward nixos-rebuild --build-host"
+    )]
+    pub build_host: Option<String>,
+    #[arg(long, global = true, help = "Forward nixos-rebuild --use-remote-sudo")]
+    pub use_remote_sudo: bool,
     #[command(subcommand)]
     pub command: Option<NrCommand>,
 }
@@ -104,13 +122,15 @@ pub enum NrCommand {
     #[command(about = "Build the selected host without activating it")]
     Build(Passthrough),
     #[command(about = "Build and activate the selected host")]
-    Switch(Passthrough),
+    Switch(LifecycleArgs),
     #[command(about = "Build and activate until the next reboot")]
-    Test(Passthrough),
+    Test(LifecycleArgs),
     #[command(about = "Build and make the generation the next boot default")]
-    Boot(Passthrough),
+    Boot(LifecycleArgs),
     #[command(about = "Build, diff, and dry-activate without mutating")]
     Preview(Passthrough),
+    #[command(about = "Activate a saved preview plan without rebuilding")]
+    Apply(ApplyArgs),
     #[command(about = "Update flake.lock or selected flake inputs")]
     Update(UpdateArgs),
     #[command(about = "Roll back to the previous generation")]
@@ -123,6 +143,22 @@ pub enum NrCommand {
     Gc(GcArgs),
     #[command(about = "Pin a NixOS generation with a label")]
     Pin(PinArgs),
+    #[command(about = "Remove a generation pin and its GC root")]
+    Unpin(UnpinArgs),
+    #[command(about = "List pinned generations and stale pin state")]
+    Pins(PinsArgs),
+    #[command(about = "Show recorded switch history")]
+    History(HistoryArgs),
+    #[command(about = "List retained logs and reports")]
+    Logs(LogsArgs),
+    #[command(about = "Print a retained lifecycle report")]
+    ShowReport(ShowReportArgs),
+    #[command(about = "Inspect flake inputs")]
+    Inputs(InputsArgs),
+    #[command(about = "Create a starter nr config")]
+    InitConfig(InitConfigArgs),
+    #[command(about = "Generate shell completions")]
+    Completions(CompletionArgs),
     #[command(about = "Review, commit, and optionally push")]
     Publish(PublishArgs),
     #[command(about = "Run configured checks")]
@@ -140,11 +176,49 @@ pub struct Passthrough {
 }
 
 #[derive(Clone, Debug, Default, Args)]
+pub struct LifecycleArgs {
+    #[arg(long, value_name = "PLAN")]
+    pub from_plan: Option<String>,
+    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    pub backend_args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ApplyAction {
+    #[default]
+    Switch,
+    Test,
+    Boot,
+}
+
+impl ApplyAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::Test => "test",
+            Self::Boot => "boot",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct ApplyArgs {
+    #[arg(value_name = "PLAN", default_value = "latest")]
+    pub plan: String,
+    #[arg(long, value_enum, default_value = "switch")]
+    pub action: ApplyAction,
+    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    pub backend_args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Args)]
 pub struct UpdateArgs {
     #[arg(value_name = "INPUT")]
     pub inputs: Vec<String>,
     #[arg(long)]
     pub switch: bool,
+    #[arg(long)]
+    pub revert_on_failure: bool,
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -198,6 +272,62 @@ pub struct PinArgs {
     pub label: String,
     #[arg(long)]
     pub force: bool,
+    #[arg(long)]
+    pub no_gc_root: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct UnpinArgs {
+    #[arg(value_name = "LABEL")]
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct PinsArgs {
+    #[arg(long)]
+    pub check_stale: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct HistoryArgs {
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct LogsArgs {
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    #[arg(long)]
+    pub last_failed: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ShowReportArgs {
+    #[arg(value_name = "REPORT", default_value = "latest")]
+    pub report: String,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct InputsArgs {
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, value_name = "INPUT")]
+    pub update: Vec<String>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct InitConfigArgs {
+    #[arg(long)]
+    pub user: bool,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct CompletionArgs {
+    #[arg(value_enum)]
+    pub shell: Shell,
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -226,6 +356,12 @@ pub struct CheckArgs {
     pub clippy: bool,
     #[arg(long = "no-flake")]
     pub no_flake: bool,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, value_name = "NAME")]
+    pub only: Vec<String>,
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout: Option<u64>,
 }
 
 impl Cli {
@@ -237,8 +373,27 @@ impl Cli {
             specialisation: self.specialisation.clone(),
             elevate: self.elevate.clone(),
             ask_elevate_password: self.ask_elevate_password,
+            target_host: self.target_host.clone(),
+            build_host: self.build_host.clone(),
+            use_remote_sudo: self.use_remote_sudo,
             backend_args: backend_args.to_vec(),
         }
+    }
+
+    pub fn backend_options_with_config(
+        &self,
+        config: &NrConfig,
+        backend_args: &[String],
+    ) -> BackendOptions {
+        let mut options = self.backend_options(backend_args);
+        if options.target_host.is_none() {
+            options.target_host = config.remote.target_host.clone();
+        }
+        if options.build_host.is_none() {
+            options.build_host = config.remote.build_host.clone();
+        }
+        options.use_remote_sudo |= config.remote.use_remote_sudo;
+        options
     }
 
     pub fn config_input(&self) -> ConfigInput {
@@ -288,14 +443,13 @@ pub fn run() -> Result<i32> {
         NrCommand::Build(args) => {
             crate::lifecycle::run_lifecycle("build", &cli, &args.backend_args)
         }
-        NrCommand::Switch(args) => {
-            crate::lifecycle::run_lifecycle("switch", &cli, &args.backend_args)
-        }
-        NrCommand::Test(args) => crate::lifecycle::run_lifecycle("test", &cli, &args.backend_args),
-        NrCommand::Boot(args) => crate::lifecycle::run_lifecycle("boot", &cli, &args.backend_args),
+        NrCommand::Switch(args) => crate::lifecycle::run_lifecycle_command("switch", &cli, args),
+        NrCommand::Test(args) => crate::lifecycle::run_lifecycle_command("test", &cli, args),
+        NrCommand::Boot(args) => crate::lifecycle::run_lifecycle_command("boot", &cli, args),
         NrCommand::Preview(args) => {
             crate::lifecycle::run_lifecycle("preview", &cli, &args.backend_args)
         }
+        NrCommand::Apply(args) => crate::lifecycle::run_apply(&cli, args),
         NrCommand::Update(args) => {
             let config = load_config(cli.config_input())?;
             crate::lifecycle::run_update(&cli, &config, args)
@@ -305,6 +459,21 @@ pub fn run() -> Result<i32> {
         NrCommand::Diff(args) => crate::lifecycle::run_diff(&cli, args),
         NrCommand::Gc(args) => crate::lifecycle::run_gc(args),
         NrCommand::Pin(args) => crate::generations::run_pin(args),
+        NrCommand::Unpin(args) => crate::generations::run_unpin(args),
+        NrCommand::Pins(args) => crate::generations::run_pins(args),
+        NrCommand::History(args) => crate::lifecycle::run_history(args),
+        NrCommand::Logs(args) => crate::lifecycle::run_logs(args),
+        NrCommand::ShowReport(args) => crate::lifecycle::run_show_report(args),
+        NrCommand::Inputs(args) => {
+            let config = load_config(cli.config_input())?;
+            crate::inputs::run_inputs(&cli, &config, args)
+        }
+        NrCommand::InitConfig(args) => crate::config::run_init_config(&cli.config_input(), args),
+        NrCommand::Completions(args) => {
+            let mut command = Cli::command();
+            generate(args.shell, &mut command, "nr", &mut io::stdout());
+            Ok(0)
+        }
         NrCommand::Publish(args) => {
             let config = load_config(cli.config_input())?;
             crate::publish::run_publish(&config, args)

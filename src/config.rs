@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::cli::InitConfigArgs;
 use crate::errors::{IoContext, NrError, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,23 +58,85 @@ impl Default for PublishSettings {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookSettings {
+    pub pre_build: Vec<HookCommand>,
+    pub post_build: Vec<HookCommand>,
+    pub pre_activate: Vec<HookCommand>,
+    pub post_activate: Vec<HookCommand>,
     pub post_switch: Vec<HookCommand>,
+    pub on_failure: Vec<HookCommand>,
+    pub timeout_seconds: u64,
+}
+
+impl Default for HookSettings {
+    fn default() -> Self {
+        Self {
+            pre_build: Vec::new(),
+            post_build: Vec::new(),
+            pre_activate: Vec::new(),
+            post_activate: Vec::new(),
+            post_switch: Vec::new(),
+            on_failure: Vec::new(),
+            timeout_seconds: 300,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiSettings {
+    pub accent: Option<String>,
+    pub graph_depth: usize,
+    pub refresh_ms: u64,
+    pub verbose_backend: bool,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            accent: None,
+            graph_depth: 12,
+            refresh_ms: 500,
+            verbose_backend: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateSettings {
+    pub keep_logs: usize,
+    pub keep_reports: usize,
+    pub keep_history: usize,
+    pub keep_plans: usize,
+}
+
+impl Default for StateSettings {
+    fn default() -> Self {
+        Self {
+            keep_logs: 20,
+            keep_reports: 20,
+            keep_history: 50,
+            keep_plans: 10,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct UiSettings {
-    pub accent: Option<String>,
+pub struct RemoteSettings {
+    pub target_host: Option<String>,
+    pub build_host: Option<String>,
+    pub use_remote_sudo: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NrConfig {
     pub target: FlakeTarget,
+    pub remote: RemoteSettings,
     pub check: CheckSettings,
     pub publish: PublishSettings,
     pub hooks: HookSettings,
     pub ui: UiSettings,
+    pub state: StateSettings,
     pub user_config_path: Option<PathBuf>,
     pub repo_config_path: Option<PathBuf>,
 }
@@ -95,6 +158,7 @@ struct ConfigData {
     publish: PublishConfig,
     hooks: HooksConfig,
     ui: UiConfig,
+    state: StateConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -102,6 +166,9 @@ struct ConfigData {
 struct TargetConfig {
     flake: Option<String>,
     host: Option<String>,
+    target_host: Option<String>,
+    build_host: Option<String>,
+    use_remote_sudo: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -124,13 +191,31 @@ struct PublishConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct HooksConfig {
+    pre_build: Option<Vec<HookCommand>>,
+    post_build: Option<Vec<HookCommand>>,
+    pre_activate: Option<Vec<HookCommand>>,
+    post_activate: Option<Vec<HookCommand>>,
     post_switch: Option<Vec<HookCommand>>,
+    on_failure: Option<Vec<HookCommand>>,
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct UiConfig {
     accent: Option<String>,
+    graph_depth: Option<usize>,
+    refresh_ms: Option<u64>,
+    verbose_backend: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StateConfig {
+    keep_logs: Option<usize>,
+    keep_reports: Option<usize>,
+    keep_history: Option<usize>,
+    keep_plans: Option<usize>,
 }
 
 pub fn find_flake(start: &Path) -> Option<PathBuf> {
@@ -241,6 +326,47 @@ pub fn discover_target(input: ConfigInput) -> Result<FlakeTarget> {
     Ok(load_config(input)?.target)
 }
 
+pub fn run_init_config(input: &ConfigInput, args: &InitConfigArgs) -> Result<i32> {
+    let environment = input
+        .environ
+        .clone()
+        .unwrap_or_else(|| env::vars().collect::<Vec<(String, String)>>());
+    let cwd = input
+        .cwd
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let path = if args.user {
+        user_config_path(&environment)
+    } else if let Some(raw) = input
+        .flake
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let (path_text, _) = split_flake_reference(raw)?;
+        let flake_path = resolve_config_path(&path_text, Some(&cwd), &environment);
+        validate_flake_path(&flake_path)?;
+        flake_path.join(".nr.toml")
+    } else {
+        find_flake(&cwd)
+            .unwrap_or_else(|| absolute_path(&cwd))
+            .join(".nr.toml")
+    };
+    if path.exists() && !args.force {
+        return Err(NrError::message(format!(
+            "Config already exists: {}. Use --force to overwrite.",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, default_config_template())
+        .with_context(format!("failed to write {}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(0)
+}
+
 fn finish_config(
     flake_path: PathBuf,
     cli_host: Option<String>,
@@ -278,20 +404,26 @@ fn finish_config(
     }
 
     let mut check = CheckSettings::default();
+    let mut remote = RemoteSettings::default();
     let mut publish = PublishSettings::default();
     let mut hooks = HookSettings::default();
     let mut ui = UiSettings::default();
+    let mut state = StateSettings::default();
     if let Some(data) = &user_data {
         check = merge_check_settings(check, data);
+        remote = merge_remote_settings(remote, data)?;
         publish = merge_publish_settings(publish, data)?;
         hooks = merge_hook_settings(hooks, data);
         ui = merge_ui_settings(ui, data)?;
+        state = merge_state_settings(state, data);
     }
     if let Some(data) = &repo_data {
         check = merge_check_settings(check, data);
+        remote = merge_remote_settings(remote, data)?;
         publish = merge_publish_settings(publish, data)?;
         hooks = merge_hook_settings(hooks, data);
         ui = merge_ui_settings(ui, data)?;
+        state = merge_state_settings(state, data);
     }
 
     Ok(NrConfig {
@@ -299,10 +431,12 @@ fn finish_config(
             path: flake_path,
             host: selected_host,
         },
+        remote,
         check,
         publish,
         hooks,
         ui,
+        state,
         user_config_path: user_data.as_ref().map(|_| user_path),
         repo_config_path: repo_data.as_ref().map(|_| repo_path),
     })
@@ -349,6 +483,15 @@ fn publish_remote(data: &ConfigData) -> Result<Option<String>> {
     non_empty_string(data.publish.remote.as_ref(), "[publish].remote")
 }
 
+fn target_remote_host(data: &ConfigData, key: &str) -> Result<Option<String>> {
+    let value = match key {
+        "target_host" => data.target.target_host.as_ref(),
+        "build_host" => data.target.build_host.as_ref(),
+        _ => None,
+    };
+    non_empty_string(value, &format!("[target].{key}"))
+}
+
 fn non_empty_string(value: Option<&String>, label: &str) -> Result<Option<String>> {
     let Some(value) = value else {
         return Ok(None);
@@ -382,6 +525,19 @@ fn merge_check_settings(mut base: CheckSettings, data: &ConfigData) -> CheckSett
     base
 }
 
+fn merge_remote_settings(mut base: RemoteSettings, data: &ConfigData) -> Result<RemoteSettings> {
+    if let Some(target_host) = target_remote_host(data, "target_host")? {
+        base.target_host = Some(target_host);
+    }
+    if let Some(build_host) = target_remote_host(data, "build_host")? {
+        base.build_host = Some(build_host);
+    }
+    if let Some(value) = data.target.use_remote_sudo {
+        base.use_remote_sudo = value;
+    }
+    Ok(base)
+}
+
 fn merge_publish_settings(mut base: PublishSettings, data: &ConfigData) -> Result<PublishSettings> {
     if let Some(remote) = publish_remote(data)? {
         base.remote = remote;
@@ -390,8 +546,26 @@ fn merge_publish_settings(mut base: PublishSettings, data: &ConfigData) -> Resul
 }
 
 fn merge_hook_settings(mut base: HookSettings, data: &ConfigData) -> HookSettings {
+    if let Some(commands) = &data.hooks.pre_build {
+        base.pre_build = commands.clone();
+    }
+    if let Some(commands) = &data.hooks.post_build {
+        base.post_build = commands.clone();
+    }
+    if let Some(commands) = &data.hooks.pre_activate {
+        base.pre_activate = commands.clone();
+    }
+    if let Some(commands) = &data.hooks.post_activate {
+        base.post_activate = commands.clone();
+    }
     if let Some(commands) = &data.hooks.post_switch {
         base.post_switch = commands.clone();
+    }
+    if let Some(commands) = &data.hooks.on_failure {
+        base.on_failure = commands.clone();
+    }
+    if let Some(timeout_seconds) = data.hooks.timeout_seconds {
+        base.timeout_seconds = timeout_seconds.max(1);
     }
     base
 }
@@ -406,7 +580,32 @@ fn merge_ui_settings(mut base: UiSettings, data: &ConfigData) -> Result<UiSettin
         }
         base.accent = Some(accent.to_string());
     }
+    if let Some(depth) = data.ui.graph_depth {
+        base.graph_depth = depth.clamp(1, 100);
+    }
+    if let Some(refresh_ms) = data.ui.refresh_ms {
+        base.refresh_ms = refresh_ms.clamp(50, 10_000);
+    }
+    if let Some(value) = data.ui.verbose_backend {
+        base.verbose_backend = value;
+    }
     Ok(base)
+}
+
+fn merge_state_settings(mut base: StateSettings, data: &ConfigData) -> StateSettings {
+    if let Some(value) = data.state.keep_logs {
+        base.keep_logs = value.max(1);
+    }
+    if let Some(value) = data.state.keep_reports {
+        base.keep_reports = value.max(1);
+    }
+    if let Some(value) = data.state.keep_history {
+        base.keep_history = value.max(1);
+    }
+    if let Some(value) = data.state.keep_plans {
+        base.keep_plans = value.max(1);
+    }
+    base
 }
 
 fn is_hex_color(value: &str) -> bool {
@@ -468,4 +667,47 @@ fn absolute_path(path: &Path) -> PathBuf {
 
 fn existing_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn default_config_template() -> &'static str {
+    r##"# nr configuration
+
+[target]
+# host = "nixos"
+# target_host = "root@example-host"
+# build_host = "builder@example-host"
+# use_remote_sudo = true
+
+[check]
+flake = true
+nixfmt = false
+statix = false
+cargo_fmt = false
+clippy = false
+commands = []
+
+[publish]
+remote = "origin"
+
+[hooks]
+timeout_seconds = 300
+pre_build = []
+post_build = []
+pre_activate = []
+post_activate = []
+post_switch = []
+on_failure = []
+
+[ui]
+accent = "#5fb3b3"
+graph_depth = 12
+refresh_ms = 500
+verbose_backend = false
+
+[state]
+keep_logs = 20
+keep_reports = 20
+keep_history = 50
+keep_plans = 10
+"##
 }

@@ -6,7 +6,7 @@ use clap::ValueEnum;
 use serde_json::json;
 use terminal_size::{Width, terminal_size};
 
-use crate::config::FlakeTarget;
+use crate::config::{FlakeTarget, UiSettings};
 use crate::events::{BuildState, NixEvent};
 use crate::git::GitSummary;
 use crate::impact::{ActivationImpact, ClosureDiff, GenerationInfo};
@@ -20,6 +20,7 @@ pub enum OutputMode {
     Plain,
     Raw,
     Json,
+    Jsonl,
 }
 
 impl OutputMode {
@@ -31,6 +32,7 @@ impl OutputMode {
             "plain" => Some(Self::Plain),
             "raw" => Some(Self::Raw),
             "json" => Some(Self::Json),
+            "jsonl" => Some(Self::Jsonl),
             _ => None,
         }
     }
@@ -94,6 +96,9 @@ pub struct Renderer {
     last_rich_render: Instant,
     last_rich_lines: usize,
     last_rich_width: Option<usize>,
+    graph_depth: usize,
+    refresh: Duration,
+    verbose_backend: bool,
 }
 
 impl Renderer {
@@ -104,22 +109,37 @@ impl Renderer {
             last_rich_render: Instant::now() - Duration::from_secs(1),
             last_rich_lines: 0,
             last_rich_width: None,
+            graph_depth: 12,
+            refresh: Duration::from_millis(500),
+            verbose_backend: false,
         }
     }
 
-    pub fn new_for_lifecycle(mode: OutputMode, action: &str, accent: Option<String>) -> Self {
+    pub fn new_for_lifecycle(mode: OutputMode, action: &str, settings: UiSettings) -> Self {
         Self {
             mode: mode.effective_for_lifecycle(action),
-            accent: accent.and_then(|value| AccentColor::parse(&value)),
+            accent: settings.accent.and_then(|value| AccentColor::parse(&value)),
             last_rich_render: Instant::now() - Duration::from_secs(1),
             last_rich_lines: 0,
             last_rich_width: None,
+            graph_depth: settings.graph_depth,
+            refresh: Duration::from_millis(settings.refresh_ms),
+            verbose_backend: settings.verbose_backend,
         }
     }
 
     pub fn start(&mut self, header: &RebuildHeader) {
         match self.mode {
             OutputMode::Json => {}
+            OutputMode::Jsonl => println!(
+                "{}",
+                json!({
+                    "event": "start",
+                    "command": header.command,
+                    "target": header.target.reference(),
+                    "log_path": header.log_path.display().to_string(),
+                })
+            ),
             OutputMode::Raw => {
                 eprintln!("nr {} {}", header.command, header.target.reference());
             }
@@ -144,6 +164,7 @@ impl Renderer {
     pub fn phase(&mut self, phase: &str) {
         match self.mode {
             OutputMode::Json | OutputMode::Raw => {}
+            OutputMode::Jsonl => println!("{}", json!({"event": "phase", "phase": phase})),
             OutputMode::Plain => println!("▶ {phase}"),
             OutputMode::Nom => println!("{}", self.accent_line(&format!("▶ {phase}"))),
             OutputMode::Rich | OutputMode::Auto => {
@@ -158,6 +179,18 @@ impl Renderer {
             OutputMode::Rich | OutputMode::Auto => self.render_rich_state(state),
             OutputMode::Nom | OutputMode::Plain => {}
             OutputMode::Raw | OutputMode::Json => {}
+            OutputMode::Jsonl => println!(
+                "{}",
+                json!({
+                    "event": "build",
+                    "action": _event.action,
+                    "id": _event.id,
+                    "phase": state.phase,
+                    "running": state.running.len(),
+                    "completed": state.completed,
+                    "failed": state.failed,
+                })
+            ),
         }
     }
 
@@ -168,7 +201,7 @@ impl Renderer {
                 StreamSource::Stderr => eprintln!("{}", line.line),
             },
             OutputMode::Rich | OutputMode::Nom | OutputMode::Plain | OutputMode::Auto => {
-                if should_print_backend_line(&line.line) {
+                if self.verbose_backend || should_print_backend_line(&line.line) {
                     if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
                         self.clear_rich_block();
                     }
@@ -176,11 +209,28 @@ impl Renderer {
                 }
             }
             OutputMode::Json => {}
+            OutputMode::Jsonl => {
+                if self.verbose_backend || should_print_backend_line(&line.line) {
+                    println!(
+                        "{}",
+                        json!({
+                            "event": "backend",
+                            "source": match line.source {
+                                StreamSource::Stdout => "stdout",
+                                StreamSource::Stderr => "stderr",
+                            },
+                            "line": line.line,
+                        })
+                    );
+                }
+            }
         }
     }
 
     pub fn parser_fallback(&mut self) {
-        if self.mode != OutputMode::Json {
+        if self.mode == OutputMode::Jsonl {
+            println!("{}", json!({"event": "parser_fallback"}));
+        } else if self.mode != OutputMode::Json {
             if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
                 self.clear_rich_block();
             }
@@ -201,6 +251,17 @@ impl Renderer {
     pub fn diff(&mut self, diff: &ClosureDiff) {
         match self.mode {
             OutputMode::Json => {}
+            OutputMode::Jsonl => println!(
+                "{}",
+                json!({
+                    "event": "diff",
+                    "additions": diff.additions.len(),
+                    "removals": diff.removals.len(),
+                    "upgrades": diff.upgrades.len(),
+                    "downgrades": diff.downgrades.len(),
+                    "unavailable": diff.unavailable,
+                })
+            ),
             OutputMode::Raw => {
                 if !diff.raw.is_empty() {
                     print!("{}", diff.raw);
@@ -218,6 +279,18 @@ impl Renderer {
     pub fn activation(&mut self, activation: &ActivationImpact) {
         match self.mode {
             OutputMode::Json => {}
+            OutputMode::Jsonl => println!(
+                "{}",
+                json!({
+                    "event": "activation",
+                    "stopped": activation.stopped,
+                    "started": activation.started,
+                    "restarted": activation.restarted,
+                    "reloaded": activation.reloaded,
+                    "failed": activation.failed,
+                    "unavailable": activation.unavailable,
+                })
+            ),
             OutputMode::Raw => {
                 if !activation.raw.is_empty() {
                     print!("{}", activation.raw);
@@ -235,6 +308,13 @@ impl Renderer {
     pub fn finish(&mut self, report: &RebuildReport) {
         match self.mode {
             OutputMode::Json => println!("{}", report_json(report)),
+            OutputMode::Jsonl => println!(
+                "{}",
+                json!({
+                    "event": "finish",
+                    "report": report_value(report),
+                })
+            ),
             OutputMode::Raw => {}
             OutputMode::Plain | OutputMode::Rich | OutputMode::Nom | OutputMode::Auto => {
                 if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
@@ -271,9 +351,7 @@ impl Renderer {
 
     fn render_rich_state(&mut self, state: &BuildState) {
         let width = terminal_width();
-        if self.last_rich_render.elapsed() < Duration::from_millis(500)
-            && self.last_rich_width == Some(width)
-        {
+        if self.last_rich_render.elapsed() < self.refresh && self.last_rich_width == Some(width) {
             return;
         }
         self.render_rich_state_at_width(state, width);
@@ -286,7 +364,7 @@ impl Renderer {
     fn render_rich_state_at_width(&mut self, state: &BuildState, width: usize) {
         self.last_rich_render = Instant::now();
         self.last_rich_width = Some(width);
-        let lines = build_graph_lines(state, width);
+        let lines = build_graph_lines_with_depth(state, width, self.graph_depth);
         self.clear_rich_block();
         for line in &lines {
             println!("{line}");
@@ -332,7 +410,16 @@ fn uses_build_ui_by_default(action: &str) -> bool {
     matches!(action, "build" | "switch" | "test" | "boot" | "preview")
 }
 
+#[cfg(test)]
 fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
+    build_graph_lines_with_depth(state, width, 12)
+}
+
+fn build_graph_lines_with_depth(
+    state: &BuildState,
+    width: usize,
+    graph_depth: usize,
+) -> Vec<String> {
     let width = width.clamp(48, 180);
     let phase = if state.phase.is_empty() {
         "building"
@@ -367,7 +454,7 @@ fn build_graph_lines(state: &BuildState, width: usize) -> Vec<String> {
     lines.push("Dependency Graph:".to_string());
     let active_derivations = state.active_derivation_paths();
     if let Some(path) = state.dependency_graph.active_path(&active_derivations) {
-        push_dependency_path(state, &path, &mut lines, 12);
+        push_dependency_path(state, &path, &mut lines, graph_depth.max(1));
     } else if state.dependency_graph.roots_loaded() {
         lines.push("`-- waiting for an active derivation in the loaded graph".to_string());
         push_active_derivations(&active_derivations, &mut lines);
@@ -630,7 +717,11 @@ fn print_units(label: &str, values: &[String]) {
     }
 }
 
-fn report_json(report: &RebuildReport) -> String {
+pub fn report_json(report: &RebuildReport) -> String {
+    report_value(report).to_string()
+}
+
+pub fn report_value(report: &RebuildReport) -> serde_json::Value {
     let store_path = report
         .store_path
         .as_ref()
@@ -678,7 +769,6 @@ fn report_json(report: &RebuildReport) -> String {
         "diff": diff,
         "activation": activation,
     })
-    .to_string()
 }
 
 #[cfg(test)]

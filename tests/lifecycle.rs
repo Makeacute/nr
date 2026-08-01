@@ -49,6 +49,227 @@ fn preview_builds_diffs_and_dry_activates_without_switching() {
 }
 
 #[test]
+fn preview_saves_plan_and_apply_uses_it_without_rebuilding() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    let (_fake, bin, command_log) = support::fake_bin();
+    let xdg_state = flake.path().join("state");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let preview = nr_command()
+        .env("PATH", &path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "plain",
+            "--target-host",
+            "root@remote",
+            "--build-host",
+            "builder",
+            "--use-remote-sudo",
+            "preview",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&preview.stdout),
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert_eq!(
+        std::fs::read_dir(xdg_state.join("nr/plans"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(xdg_state.join("nr/reports"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    std::fs::write(&command_log, "").unwrap();
+    let apply = nr_command()
+        .env("PATH", &path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "plain",
+            "apply",
+            "latest",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let log = support::command_log(&command_log);
+    assert!(!log.contains("nixos-rebuild build"));
+    assert!(log.contains("nixos-rebuild switch"));
+    assert!(log.contains("--target-host root@remote"));
+    assert!(log.contains("--build-host builder"));
+    assert!(log.contains("--use-remote-sudo"));
+    assert!(xdg_state.join("nr/history.json").is_file());
+}
+
+#[test]
+fn state_retention_limits_plans_and_reports() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    std::fs::write(
+        flake.path().join(".nr.toml"),
+        r#"
+[state]
+keep_reports = 1
+keep_plans = 1
+"#,
+    )
+    .unwrap();
+    let (_fake, bin, command_log) = support::fake_bin();
+    let xdg_state = flake.path().join("state");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    for _ in 0..2 {
+        let output = nr_command()
+            .env("PATH", &path)
+            .env("NR_FAKE_LOG", &command_log)
+            .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+            .env("XDG_STATE_HOME", &xdg_state)
+            .args([
+                "--flake",
+                &format!("{}#host", flake.path().display()),
+                "--ui",
+                "plain",
+                "preview",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+
+    assert_eq!(
+        std::fs::read_dir(xdg_state.join("nr/plans"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(xdg_state.join("nr/reports"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn pin_creates_gc_root_and_unpin_removes_it() {
+    let flake = support::TestDir::new();
+    let xdg_state = flake.path().join("state");
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let pin = nr_command()
+        .env("PATH", &path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["pin", "1", "last-good"])
+        .output()
+        .unwrap();
+    assert!(
+        pin.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&pin.stdout),
+        String::from_utf8_lossy(&pin.stderr)
+    );
+    assert!(
+        xdg_state
+            .join("nr/pin-roots/last-good")
+            .symlink_metadata()
+            .is_ok()
+    );
+
+    let pins = nr_command()
+        .env("PATH", &path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["pins"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&pins.stdout).contains("last-good -> 1"));
+
+    let unpin = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["unpin", "last-good"])
+        .output()
+        .unwrap();
+    assert!(unpin.status.success());
+    assert!(
+        xdg_state
+            .join("nr/pin-roots/last-good")
+            .symlink_metadata()
+            .is_err()
+    );
+}
+
+#[test]
+fn inputs_lists_lock_nodes() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "inputs",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("nixpkgs"));
+}
+
+#[test]
 fn json_ui_outputs_structured_report() {
     let flake = support::TestDir::new();
     support::make_flake(flake.path());
@@ -384,7 +605,7 @@ post_switch = [["hook-success", "waybar"]]
 }
 
 #[test]
-fn failing_post_switch_hook_preserves_hook_exit_code() {
+fn failing_post_switch_hook_is_warning_after_successful_switch() {
     let flake = support::TestDir::new();
     support::make_flake(flake.path());
     std::fs::write(
@@ -418,14 +639,101 @@ post_switch = [["hook-fail"]]
         ])
         .output()
         .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(66),
+    assert!(
+        output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("post-switch hook failed"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("switch complete"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("warning: post-switch hook failed after successful activation")
+    );
+    let log = support::command_log(&command_log);
+    assert!(log.contains("nixos-rebuild switch"));
+    assert!(log.contains("hook-fail"));
+}
+
+#[test]
+fn hooks_receive_env_and_pre_build_timeout_fails_before_build() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    std::fs::write(
+        flake.path().join(".nr.toml"),
+        r#"
+[hooks]
+timeout_seconds = 1
+pre_build = [["hook-success", "pre"]]
+post_build = [["hook-success", "post"]]
+"#,
+    )
+    .unwrap();
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", &path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "plain",
+            "build",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = support::command_log(&command_log);
+    assert!(log.contains("hook-env pre_build"));
+    assert!(log.contains(&format!("{}#host", flake.path().display())));
+    assert!(log.contains("hook-env post_build"));
+    assert!(log.contains("/nix/store/fake-system"));
+
+    std::fs::write(
+        flake.path().join(".nr.toml"),
+        r#"
+[hooks]
+timeout_seconds = 1
+pre_build = [["hook-slow"]]
+"#,
+    )
+    .unwrap();
+    std::fs::write(&command_log, "").unwrap();
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "plain",
+            "build",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = support::command_log(&command_log);
+    assert!(log.contains("hook-slow"));
+    assert!(!log.contains("nixos-rebuild build"));
 }
 
 #[test]
@@ -548,6 +856,198 @@ fn default_logs_rotate_to_latest_twenty() {
 
     let count = std::fs::read_dir(&logs).unwrap().count();
     assert_eq!(count, 20);
+}
+
+#[test]
+fn history_is_bounded_and_logs_show_reports_are_discoverable() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    std::fs::write(
+        flake.path().join(".nr.toml"),
+        r#"
+[state]
+keep_history = 1
+keep_reports = 2
+"#,
+    )
+    .unwrap();
+    let (_fake, bin, command_log) = support::fake_bin();
+    let xdg_state = flake.path().join("state");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    for _ in 0..2 {
+        let output = nr_command()
+            .env("PATH", &path)
+            .env("NR_FAKE_LOG", &command_log)
+            .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+            .env("XDG_STATE_HOME", &xdg_state)
+            .args([
+                "--flake",
+                &format!("{}#host", flake.path().display()),
+                "--ui",
+                "plain",
+                "switch",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let history_text = std::fs::read_to_string(xdg_state.join("nr/history.json")).unwrap();
+    let history: serde_json::Value = serde_json::from_str(&history_text).unwrap();
+    assert_eq!(history["entries"].as_array().unwrap().len(), 1);
+
+    let history_output = nr_command()
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["history"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&history_output.stdout).contains("switch complete"));
+
+    let logs_output = nr_command()
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["logs", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&logs_output.stdout).contains("nr-"));
+
+    let report_output = nr_command()
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["show-report", "latest"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&report_output.stdout).contains("\"success\": true"));
+}
+
+#[test]
+fn jsonl_ui_outputs_line_delimited_events() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "jsonl",
+            "preview",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| event["event"] == "start"));
+    assert!(events.iter().any(|event| event["event"] == "finish"));
+}
+
+#[test]
+fn update_switch_reverts_lockfile_to_pre_update_state_on_failure() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    std::fs::write(flake.path().join("flake.lock"), "original\n").unwrap();
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("NR_FAKE_UPDATE_WRITE_LOCK", "1")
+        .env("NR_FAKE_ACTIVATE_FAIL", "1")
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--ui",
+            "plain",
+            "update",
+            "--switch",
+            "--revert-on-failure",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(44),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(flake.path().join("flake.lock")).unwrap(),
+        "original\n"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("reverted flake.lock"));
+}
+
+#[test]
+fn remote_diff_defaults_from_remote_current_system() {
+    let flake = support::TestDir::new();
+    support::make_flake(flake.path());
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env("XDG_CONFIG_HOME", flake.path().join("xdg"))
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "--target-host",
+            "root@remote",
+            "--ui",
+            "plain",
+            "diff",
+            "--to",
+            "/nix/store/fake-system",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = support::command_log(&command_log);
+    assert!(log.contains("ssh root@remote readlink -f '/run/current-system'"));
+    assert!(log.contains(
+        "nix store diff-closures /nix/store/remote-current-system /nix/store/fake-system"
+    ));
 }
 
 #[test]

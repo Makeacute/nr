@@ -9,10 +9,12 @@ pub mod generations;
 pub mod git;
 pub mod help;
 pub mod impact;
+pub mod inputs;
 pub mod lifecycle;
 pub mod process;
 pub mod prompts;
 pub mod publish;
+pub mod state;
 pub mod ui;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

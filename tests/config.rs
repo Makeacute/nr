@@ -2,9 +2,10 @@ mod support;
 
 use std::fs;
 
+use nr::cli::InitConfigArgs;
 use nr::config::{
-    CheckSettings, ConfigInput, FlakeTarget, HookSettings, UiSettings, load_config,
-    split_flake_reference, validate_flake_path,
+    CheckSettings, ConfigInput, FlakeTarget, HookSettings, StateSettings, UiSettings, load_config,
+    run_init_config, split_flake_reference, validate_flake_path,
 };
 
 #[test]
@@ -128,14 +129,17 @@ statix = true
                 "restart".to_string(),
                 "waybar.service".to_string(),
             ]],
+            ..HookSettings::default()
         }
     );
     assert_eq!(
         config.ui,
         UiSettings {
             accent: Some("#cba6f7".to_string()),
+            ..UiSettings::default()
         }
     );
+    assert_eq!(config.state, StateSettings::default());
 }
 
 #[test]
@@ -144,6 +148,30 @@ fn validate_flake_path_requires_flake_file() {
     assert!(validate_flake_path(temp.path()).is_err());
     support::make_flake(temp.path());
     validate_flake_path(temp.path()).unwrap();
+}
+
+#[test]
+fn init_config_honors_explicit_flake_path() {
+    let temp = support::TestDir::new();
+    let cwd_flake = support::make_flake(&temp.path().join("cwd"));
+    let selected_flake = support::make_flake(&temp.path().join("selected"));
+
+    run_init_config(
+        &ConfigInput {
+            flake: Some(format!("{}#host", selected_flake.display())),
+            cwd: Some(cwd_flake.clone()),
+            environ: Some(vec![]),
+            ..ConfigInput::default()
+        },
+        &InitConfigArgs {
+            user: false,
+            force: false,
+        },
+    )
+    .unwrap();
+
+    assert!(selected_flake.join(".nr.toml").is_file());
+    assert!(!cwd_flake.join(".nr.toml").exists());
 }
 
 #[test]

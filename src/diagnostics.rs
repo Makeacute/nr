@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::config::NrConfig;
 use crate::git::{git_command, git_summary};
-use crate::process::run_capture;
+use crate::process::{CommandSpec, run_capture, state_dir};
 
 const REQUIRED_TOOLS: &[&str] = &["nix", "nix-store", "nixos-rebuild", "git"];
 const OPTIONAL_TOOLS: &[&str] = &["gh", "nom", "nixfmt", "statix", "cargo"];
@@ -27,6 +27,13 @@ pub fn run_doctor(config: &NrConfig) -> crate::errors::Result<i32> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "not found".to_string())
     );
+    println!(
+        "state retention: logs={} reports={} history={} plans={}",
+        config.state.keep_logs,
+        config.state.keep_reports,
+        config.state.keep_history,
+        config.state.keep_plans
+    );
 
     let mut missing_required = Vec::new();
     println!("\ndependencies:");
@@ -36,6 +43,14 @@ pub fn run_doctor(config: &NrConfig) -> crate::errors::Result<i32> {
         } else {
             missing_required.push(*tool);
             println!("  missing  {tool}");
+        }
+    }
+    if config.remote.target_host.is_some() || config.remote.build_host.is_some() {
+        if command_exists("ssh") {
+            println!("  optional {}", tool_version("ssh"));
+        } else {
+            missing_required.push("ssh");
+            println!("  missing  ssh");
         }
     }
     for tool in OPTIONAL_TOOLS {
@@ -68,6 +83,49 @@ pub fn run_doctor(config: &NrConfig) -> crate::errors::Result<i32> {
         }
     } else {
         println!("  repository: no");
+    }
+
+    println!("\nstate:");
+    let state = state_dir();
+    match std::fs::create_dir_all(&state)
+        .and_then(|_| std::fs::write(state.join(".write-test"), "ok\n"))
+        .and_then(|_| std::fs::remove_file(state.join(".write-test")))
+    {
+        Ok(()) => println!("  writable: {}", state.display()),
+        Err(error) => println!("  not writable: {} ({error})", state.display()),
+    }
+    if let Ok(output) = run_capture(
+        &CommandSpec::new("df")
+            .arg("-Pk")
+            .arg(state.display().to_string()),
+        false,
+    ) && output.code == 0
+    {
+        for line in output.stdout.lines().take(2) {
+            println!("  {line}");
+        }
+    }
+
+    println!("\nnix:");
+    if let Ok(output) = run_capture(
+        &CommandSpec::new("nix")
+            .arg("show-config")
+            .arg("experimental-features"),
+        false,
+    ) && output.code == 0
+    {
+        let text = output.stdout.trim();
+        if text.contains("flakes") && text.contains("nix-command") {
+            println!("  flakes: enabled");
+        } else {
+            println!("  flakes: not detected in experimental-features");
+        }
+    }
+    if let Some(host) = &config.remote.target_host {
+        println!("  remote target: {host}");
+    }
+    if let Some(host) = &config.remote.build_host {
+        println!("  remote builder: {host}");
     }
 
     Ok(if missing_required.is_empty() { 0 } else { 1 })

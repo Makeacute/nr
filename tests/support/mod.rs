@@ -122,6 +122,21 @@ esac
             r#"set -u
 echo "nix-store $*" >> "$NR_FAKE_LOG"
 case "$*" in
+  *"--add-root"*)
+    root=""
+    target=""
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--add-root" ]; then
+        root="$arg"
+      fi
+      target="$arg"
+      previous="$arg"
+    done
+    if [ -n "$root" ]; then
+      ln -sfn "$target" "$root"
+    fi
+    ;;
   *"--query --graph /nix/store/root-nixos-system-host.drv"*)
     cat <<'DOT'
 digraph G {
@@ -153,8 +168,24 @@ case "$*" in
     echo "openssl: 3.0 -> 3.1"
     echo "closure size: 1.0 GiB -> 1.1 GiB, +100.0 MiB"
     ;;
-  *"flake update"*)
-    echo "updated"
+	  *"flake update"*)
+	    flake="."
+	    previous=""
+	    for arg in "$@"; do
+	      if [ "$previous" = "--flake" ]; then
+	        flake="$arg"
+	      fi
+	      previous="$arg"
+	    done
+	    if [ "${NR_FAKE_UPDATE_WRITE_LOCK:-0}" = 1 ]; then
+	      printf 'updated\n' > "$flake/flake.lock"
+	    fi
+	    echo "updated"
+	    ;;
+  *"flake metadata"*)
+    cat <<'JSON'
+{"locks":{"nodes":{"root":{"inputs":{"nixpkgs":"nixpkgs"}},"nixpkgs":{"locked":{"rev":"abc"}}}}}
+JSON
     ;;
   *"flake check"*)
     echo "checked"
@@ -197,9 +228,10 @@ echo "notify-send $*" >> "$NR_FAKE_LOG"
         &script_with_shell(
             &shell,
             r#"set -u
-echo "hook-success $*" >> "$NR_FAKE_LOG"
-echo "hook ran"
-"#,
+	echo "hook-success $*" >> "$NR_FAKE_LOG"
+	echo "hook-env ${NR_HOOK:-} ${NR_TARGET:-} ${NR_STORE_PATH:-}" >> "$NR_FAKE_LOG"
+	echo "hook ran"
+	"#,
         ),
     )
     .unwrap();
@@ -213,6 +245,19 @@ echo "hook-fail $*" >> "$NR_FAKE_LOG"
 echo "hook failed" >&2
 exit 66
 "#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("hook-slow"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+	echo "hook-slow $*" >> "$NR_FAKE_LOG"
+	sleep 3
+	echo "hook should have timed out"
+	"#,
         ),
     )
     .unwrap();
@@ -238,6 +283,35 @@ case "$*" in
     ;;
 esac
 "#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("ssh"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+	echo "ssh $*" >> "$NR_FAKE_LOG"
+	case "$*" in
+	  *"readlink -f '/run/current-system'"*)
+	    echo "/nix/store/remote-current-system"
+	    ;;
+	  *"readlink -f '/nix/var/nix/profiles/system'"*)
+	    echo "/nix/var/nix/profiles/system-7-link"
+	    ;;
+	  *"readlink -f '/run/current-system/kernel'"*)
+	    echo "/nix/store/linux-remote-kernel"
+	    ;;
+	  *"cat '/run/current-system/nixos-version'"*)
+	    echo "26.11-remote"
+	    ;;
+	  *)
+	    echo "unexpected ssh command: $*" >&2
+	    exit 95
+	    ;;
+	esac
+	"#,
         ),
     )
     .unwrap();

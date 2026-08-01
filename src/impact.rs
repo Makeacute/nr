@@ -57,6 +57,24 @@ pub fn current_generation_info() -> GenerationInfo {
     }
 }
 
+pub fn current_generation_info_for_options(options: &BackendOptions) -> GenerationInfo {
+    let Some(host) = options.target_host.as_deref() else {
+        return current_generation_info();
+    };
+    GenerationInfo {
+        generation: remote_current_generation(host),
+        nixos_version: remote_read_trimmed(host, "/run/current-system/nixos-version"),
+        kernel_version: remote_kernel_version(host),
+    }
+}
+
+pub fn current_system_path_for_options(options: &BackendOptions) -> Option<PathBuf> {
+    if let Some(host) = options.target_host.as_deref() {
+        return remote_readlink(host, "/run/current-system").map(PathBuf::from);
+    }
+    Some(PathBuf::from("/run/current-system"))
+}
+
 pub fn current_generation() -> Option<u64> {
     let link = fs::read_link("/nix/var/nix/profiles/system").ok()?;
     parse_generation_from_path(&link)
@@ -86,15 +104,27 @@ pub fn diff_current_to_new(
     options: &BackendOptions,
     log: &mut LogFile,
 ) -> Result<ClosureDiff> {
-    let current = Path::new("/run/current-system");
-    if !current.exists() {
+    let current = if let Some(host) = options.target_host.as_deref() {
+        let Some(path) = current_system_path_for_options(options) else {
+            return Ok(ClosureDiff {
+                unavailable: Some(format!(
+                    "failed to inspect /run/current-system on remote target {host}"
+                )),
+                ..ClosureDiff::default()
+            });
+        };
+        path
+    } else {
+        PathBuf::from("/run/current-system")
+    };
+    if options.target_host.is_none() && !current.exists() {
         return Ok(ClosureDiff {
             unavailable: Some("/run/current-system does not exist".to_string()),
             ..ClosureDiff::default()
         });
     }
 
-    let command = backend::nix_store_diff_closures_command(current, new_path, options);
+    let command = backend::nix_store_diff_closures_command(&current, new_path, options);
     log.write_command(&command)?;
     let output = run_capture(&command, false)?;
     log.write_output(&output)?;
@@ -109,6 +139,50 @@ pub fn diff_current_to_new(
         });
     }
     Ok(parse_closure_diff(&output.stdout))
+}
+
+fn remote_current_generation(host: &str) -> Option<u64> {
+    remote_readlink(host, "/nix/var/nix/profiles/system")
+        .as_deref()
+        .and_then(|path| parse_generation_from_path(Path::new(path)))
+}
+
+fn remote_kernel_version(host: &str) -> Option<String> {
+    remote_readlink(host, "/run/current-system/kernel").and_then(|path| {
+        Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    })
+}
+
+fn remote_readlink(host: &str, path: &str) -> Option<String> {
+    let output = run_capture(
+        &backend::ssh_command(host, &format!("readlink -f {}", shell_quote(path))),
+        false,
+    )
+    .ok()?;
+    if output.code == 0 {
+        Some(output.stdout.trim().to_string()).filter(|value| !value.is_empty())
+    } else {
+        None
+    }
+}
+
+fn remote_read_trimmed(host: &str, path: &str) -> Option<String> {
+    let output = run_capture(
+        &backend::ssh_command(host, &format!("cat {}", shell_quote(path))),
+        false,
+    )
+    .ok()?;
+    if output.code == 0 {
+        Some(output.stdout.trim().to_string()).filter(|value| !value.is_empty())
+    } else {
+        None
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub fn parse_closure_diff(output: &str) -> ClosureDiff {

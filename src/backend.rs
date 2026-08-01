@@ -1,9 +1,11 @@
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::FlakeTarget;
 use crate::process::CommandSpec;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendOptions {
     pub verbose: u8,
     pub offline: bool,
@@ -11,6 +13,9 @@ pub struct BackendOptions {
     pub specialisation: Option<String>,
     pub elevate: Option<String>,
     pub ask_elevate_password: bool,
+    pub target_host: Option<String>,
+    pub build_host: Option<String>,
+    pub use_remote_sudo: bool,
     pub backend_args: Vec<String>,
 }
 
@@ -33,6 +38,22 @@ pub fn nix_common_args(options: &BackendOptions) -> Vec<String> {
     args
 }
 
+pub fn nixos_rebuild_remote_args(options: &BackendOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(host) = &options.target_host {
+        args.push("--target-host".to_string());
+        args.push(host.clone());
+    }
+    if let Some(host) = &options.build_host {
+        args.push("--build-host".to_string());
+        args.push(host.clone());
+    }
+    if options.use_remote_sudo {
+        args.push("--use-remote-sudo".to_string());
+    }
+    args
+}
+
 pub fn nixos_rebuild_build_command(target: &FlakeTarget, options: &BackendOptions) -> CommandSpec {
     let mut args = vec![
         "build".to_string(),
@@ -45,6 +66,7 @@ pub fn nixos_rebuild_build_command(target: &FlakeTarget, options: &BackendOption
     for _ in 0..options.verbose {
         args.push("--verbose".to_string());
     }
+    args.extend(nixos_rebuild_remote_args(options));
     args.extend(nix_common_args(options));
     if let Some(specialisation) = &options.specialisation {
         args.push("--specialisation".to_string());
@@ -65,6 +87,7 @@ pub fn nixos_rebuild_dry_activate_command(
         "--no-reexec".to_string(),
     ];
     args.extend(nix_common_args(options));
+    args.extend(nixos_rebuild_remote_args(options));
     args.extend(nixos_rebuild_elevation_args(options));
     args.extend(passthrough_args(&options.backend_args));
     CommandSpec::new("nixos-rebuild").args(args)
@@ -82,6 +105,7 @@ pub fn nixos_rebuild_activate_command(
         "--no-reexec".to_string(),
     ];
     args.extend(nix_common_args(options));
+    args.extend(nixos_rebuild_remote_args(options));
     args.extend(nixos_rebuild_elevation_args(options));
     if let Some(specialisation) = &options.specialisation {
         args.push("--specialisation".to_string());
@@ -114,6 +138,15 @@ pub fn nix_store_query_graph_command(path: &str) -> CommandSpec {
     ])
 }
 
+pub fn nix_store_add_root_command(root: &Path, target: &Path) -> CommandSpec {
+    CommandSpec::new("nix-store").args([
+        "--add-root".to_string(),
+        root.display().to_string(),
+        "--indirect".to_string(),
+        target.display().to_string(),
+    ])
+}
+
 pub fn nom_json_command() -> CommandSpec {
     CommandSpec::new("nom").arg("--json")
 }
@@ -142,6 +175,7 @@ pub fn rollback_command(options: &BackendOptions) -> CommandSpec {
         "--no-reexec".to_string(),
     ];
     args.extend(nix_common_args(options));
+    args.extend(nixos_rebuild_remote_args(options));
     args.extend(nixos_rebuild_elevation_args(options));
     args.extend(passthrough_args(&options.backend_args));
     CommandSpec::new("nixos-rebuild").args(args)
@@ -155,6 +189,7 @@ pub fn rollback_to_store_path_command(store_path: &Path, options: &BackendOption
         "--no-reexec".to_string(),
     ];
     args.extend(nix_common_args(options));
+    args.extend(nixos_rebuild_remote_args(options));
     args.extend(nixos_rebuild_elevation_args(options));
     args.extend(passthrough_args(&options.backend_args));
     CommandSpec::new("nixos-rebuild").args(args)
@@ -178,6 +213,23 @@ pub fn generations_command(profile: Option<&str>, backend_args: &[String]) -> Co
 
 pub fn generations_json_command() -> CommandSpec {
     CommandSpec::new("nixos-rebuild").args(["list-generations".to_string(), "--json".to_string()])
+}
+
+pub fn nix_flake_metadata_command(target: &FlakeTarget, options: &BackendOptions) -> CommandSpec {
+    let mut args = nix_common_args(options);
+    args.extend([
+        "flake".to_string(),
+        "metadata".to_string(),
+        "--json".to_string(),
+        target.path.display().to_string(),
+    ]);
+    CommandSpec::new("nix").args(args)
+}
+
+pub fn ssh_command(host: &str, command: &str) -> CommandSpec {
+    CommandSpec::new("ssh")
+        .arg(host.to_string())
+        .arg(command.to_string())
 }
 
 pub fn nix_collect_garbage_command(

@@ -1,14 +1,16 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc;
+use wait_timeout::ChildExt;
 
 use crate::errors::{IoContext, NrError, Result};
 
@@ -17,6 +19,7 @@ pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
 }
 
 impl CommandSpec {
@@ -25,6 +28,7 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             cwd: None,
+            env: Vec::new(),
         }
     }
 
@@ -44,6 +48,11 @@ impl CommandSpec {
 
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
         self.cwd = Some(path.into());
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
         self
     }
 
@@ -158,6 +167,84 @@ pub fn run_capture(command: &CommandSpec, announce: bool) -> Result<RunOutput> {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+pub fn run_capture_timeout(
+    command: &CommandSpec,
+    announce: bool,
+    timeout: Option<Duration>,
+) -> Result<RunOutput> {
+    let Some(timeout) = timeout else {
+        return run_capture(command, announce);
+    };
+    if announce {
+        println!("-> {}", command.render());
+    }
+
+    let mut child = command_builder(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| spawn_error(command, source))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| missing_pipe(command, "stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| missing_pipe(command, "stderr"))?;
+    let stdout_handle = thread::spawn(move || read_to_end(stdout));
+    let stderr_handle = thread::spawn(move || read_to_end(stderr));
+
+    let (timed_out, status) = match child.wait_timeout(timeout).with_context(format!(
+        "failed to wait for {} with timeout",
+        command.render()
+    ))? {
+        Some(status) => (false, status),
+        None => {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .with_context(format!("failed to wait for {}", command.render()))?;
+            (true, status)
+        }
+    };
+
+    let stdout = join_reader(stdout_handle, command, "stdout")?;
+    let stderr = join_reader(stderr_handle, command, "stderr")?;
+    let code = if timed_out {
+        124
+    } else {
+        status.code().unwrap_or(1)
+    };
+
+    Ok(RunOutput {
+        code,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+fn read_to_end(mut stream: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_reader(
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    command: &CommandSpec,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| NrError::Io {
+            context: format!("failed to read {stream} from {}", command.render()),
+            source: io::Error::other("reader thread panicked"),
+        })?
+        .with_context(format!("failed to read {stream} from {}", command.render()))
 }
 
 pub fn run_capture_interactive(
@@ -644,6 +731,9 @@ fn command_builder(command: &CommandSpec) -> Command {
     if let Some(cwd) = &command.cwd {
         builder.current_dir(cwd);
     }
+    for (key, value) in &command.env {
+        builder.env(key, value);
+    }
     builder
 }
 
@@ -652,6 +742,9 @@ fn tokio_command_builder(command: &CommandSpec) -> TokioCommand {
     builder.args(&command.args);
     if let Some(cwd) = &command.cwd {
         builder.current_dir(cwd);
+    }
+    for (key, value) in &command.env {
+        builder.env(key, value);
     }
     builder
 }
@@ -693,6 +786,10 @@ pub struct LogFile {
 
 impl LogFile {
     pub fn create(path: Option<PathBuf>) -> Result<Self> {
+        Self::create_with_limit(path, 20)
+    }
+
+    pub fn create_with_limit(path: Option<PathBuf>, keep_logs: usize) -> Result<Self> {
         let rotate = path.is_none();
         let path = match path {
             Some(path) => path,
@@ -705,7 +802,7 @@ impl LogFile {
         let file =
             File::create(&path).with_context(format!("failed to create {}", path.display()))?;
         if rotate && let Some(parent) = path.parent() {
-            rotate_logs(parent, 20, &path)?;
+            rotate_logs(parent, keep_logs, &path)?;
         }
         Ok(Self {
             path,
@@ -763,6 +860,9 @@ pub fn state_dir() -> PathBuf {
 }
 
 fn rotate_logs(directory: &Path, keep: usize, current_log: &Path) -> Result<()> {
+    if keep == 0 {
+        return Ok(());
+    }
     let mut logs = Vec::new();
     for entry in fs::read_dir(directory).with_context(format!(
         "failed to read log directory {}",
@@ -804,7 +904,7 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
-    use super::rotate_logs;
+    use super::{CommandSpec, rotate_logs, run_capture_timeout};
 
     #[test]
     fn log_rotation_preserves_current_log_even_when_oldest() {
@@ -821,5 +921,18 @@ mod tests {
 
         assert!(current.is_file());
         assert_eq!(fs::read_dir(temp.path()).expect("read logs").count(), 20);
+    }
+
+    #[test]
+    fn timeout_capture_drains_large_output_without_deadlock() {
+        let command = CommandSpec::new("sh")
+            .arg("-c")
+            .arg("dd if=/dev/zero bs=1024 count=1024 2>/dev/null");
+
+        let output = run_capture_timeout(&command, false, Some(Duration::from_secs(5)))
+            .expect("capture large output");
+
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.len() > 700_000);
     }
 }
