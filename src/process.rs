@@ -71,6 +71,12 @@ pub struct StreamLine {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamEvent {
+    Line(StreamLine),
+    Resize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunOutput {
     pub code: i32,
     pub stdout: String,
@@ -80,6 +86,22 @@ pub struct RunOutput {
 struct StreamChunk {
     source: StreamSource,
     bytes: Vec<u8>,
+}
+
+enum ChunkMessage {
+    Chunk(StreamChunk),
+    ReadError {
+        source: StreamSource,
+        error: io::Error,
+    },
+}
+
+enum StreamMessage {
+    Event(StreamEvent),
+    ReadError {
+        source: StreamSource,
+        error: io::Error,
+    },
 }
 
 pub fn render_command(parts: &[String]) -> String {
@@ -179,9 +201,27 @@ pub fn run_inherit(command: &CommandSpec, announce: bool) -> Result<i32> {
 
 pub fn stream_command<F>(command: &CommandSpec, announce: bool, mut on_line: F) -> Result<i32>
 where
-    F: FnMut(StreamLine),
+    F: FnMut(StreamLine) -> Result<()>,
 {
-    block_on(async_stream_command(command, announce, &mut on_line))
+    stream_command_events(command, announce, |event| match event {
+        StreamEvent::Line(line) => on_line(line),
+        StreamEvent::Resize => Ok(()),
+    })
+}
+
+pub fn stream_command_events<F>(
+    command: &CommandSpec,
+    announce: bool,
+    mut on_event: F,
+) -> Result<i32>
+where
+    F: FnMut(StreamEvent) -> Result<()>,
+{
+    block_on(async_stream_command_events(
+        command,
+        announce,
+        &mut on_event,
+    ))
 }
 
 pub fn stream_command_to_command<F, P>(
@@ -192,7 +232,7 @@ pub fn stream_command_to_command<F, P>(
     mut pipe_line: P,
 ) -> Result<i32>
 where
-    F: FnMut(StreamLine),
+    F: FnMut(StreamLine) -> Result<()>,
     P: FnMut(&StreamLine) -> bool,
 {
     block_on(async_stream_command_to_command(
@@ -232,8 +272,14 @@ async fn async_run_capture_interactive(
         .spawn()
         .map_err(|source| spawn_error(command, source))?;
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| missing_pipe(command, "stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| missing_pipe(command, "stderr"))?;
     let (sender, mut receiver) = mpsc::channel(64);
 
     tokio::spawn(read_chunks(stdout, StreamSource::Stdout, sender.clone()));
@@ -242,19 +288,25 @@ async fn async_run_capture_interactive(
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    while let Some(chunk) = receiver.recv().await {
-        match chunk.source {
-            StreamSource::Stdout => {
-                if passthrough_stdout {
-                    write_passthrough(StreamSource::Stdout, &chunk.bytes);
+    let mut read_error = None;
+    while let Some(message) = receiver.recv().await {
+        match message {
+            ChunkMessage::Chunk(chunk) => match chunk.source {
+                StreamSource::Stdout => {
+                    if passthrough_stdout {
+                        write_passthrough(StreamSource::Stdout, &chunk.bytes);
+                    }
+                    stdout.extend_from_slice(&chunk.bytes);
                 }
-                stdout.extend_from_slice(&chunk.bytes);
-            }
-            StreamSource::Stderr => {
-                if passthrough_stderr {
-                    write_passthrough(StreamSource::Stderr, &chunk.bytes);
+                StreamSource::Stderr => {
+                    if passthrough_stderr {
+                        write_passthrough(StreamSource::Stderr, &chunk.bytes);
+                    }
+                    stderr.extend_from_slice(&chunk.bytes);
                 }
-                stderr.extend_from_slice(&chunk.bytes);
+            },
+            ChunkMessage::ReadError { source, error } => {
+                read_error.get_or_insert((source, error));
             }
         }
     }
@@ -269,6 +321,9 @@ async fn async_run_capture_interactive(
     if passthrough_stderr && !stderr.is_empty() && !stderr.ends_with(b"\n") {
         eprintln!();
     }
+    if let Some((source, error)) = read_error {
+        return Err(read_error_for(command, source, error));
+    }
     Ok(RunOutput {
         code: status.code().unwrap_or(1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -276,13 +331,13 @@ async fn async_run_capture_interactive(
     })
 }
 
-async fn async_stream_command<F>(
+async fn async_stream_command_events<F>(
     command: &CommandSpec,
     announce: bool,
-    on_line: &mut F,
+    on_event: &mut F,
 ) -> Result<i32>
 where
-    F: FnMut(StreamLine),
+    F: FnMut(StreamEvent) -> Result<()>,
 {
     if announce {
         println!("-> {}", command.render());
@@ -295,22 +350,63 @@ where
         .spawn()
         .map_err(|source| spawn_error(command, source))?;
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| missing_pipe(command, "stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| missing_pipe(command, "stderr"))?;
     let (sender, mut receiver) = mpsc::channel(64);
 
     tokio::spawn(read_lines(stdout, StreamSource::Stdout, sender.clone()));
     tokio::spawn(read_lines(stderr, StreamSource::Stderr, sender.clone()));
     drop(sender);
 
-    while let Some(line) = receiver.recv().await {
-        on_line(line);
+    let mut read_error = None;
+    let mut callback_error = None;
+    let mut resize_signal = resize_signal();
+    loop {
+        tokio::select! {
+            message = receiver.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message {
+                    StreamMessage::Event(event) => {
+                        if let Err(error) = on_event(event) {
+                            callback_error = Some(error);
+                            break;
+                        }
+                    }
+                    StreamMessage::ReadError { source, error } => {
+                        read_error.get_or_insert((source, error));
+                    }
+                }
+            }
+            resized = recv_resize(&mut resize_signal) => {
+                if resized && let Err(error) = on_event(StreamEvent::Resize) {
+                    callback_error = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(error) = callback_error {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error);
     }
 
     let status = child
         .wait()
         .await
         .with_context(format!("failed to wait for {}", command.render()))?;
+    if let Some((source, error)) = read_error {
+        return Err(read_error_for(command, source, error));
+    }
     Ok(status.code().unwrap_or(1))
 }
 
@@ -322,7 +418,7 @@ async fn async_stream_command_to_command<F, P>(
     pipe_line: &mut P,
 ) -> Result<i32>
 where
-    F: FnMut(StreamLine),
+    F: FnMut(StreamLine) -> Result<()>,
     P: FnMut(&StreamLine) -> bool,
 {
     if announce {
@@ -335,7 +431,10 @@ where
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|source| spawn_error(consumer, source))?;
-    let mut consumer_stdin = consumer_child.stdin.take().expect("stdin was piped");
+    let mut consumer_stdin = consumer_child
+        .stdin
+        .take()
+        .ok_or_else(|| missing_pipe(consumer, "stdin"))?;
 
     let mut producer_child = match tokio_command_builder(producer)
         .stdin(Stdio::inherit())
@@ -352,8 +451,14 @@ where
         }
     };
 
-    let stdout = producer_child.stdout.take().expect("stdout was piped");
-    let stderr = producer_child.stderr.take().expect("stderr was piped");
+    let stdout = producer_child
+        .stdout
+        .take()
+        .ok_or_else(|| missing_pipe(producer, "stdout"))?;
+    let stderr = producer_child
+        .stderr
+        .take()
+        .ok_or_else(|| missing_pipe(producer, "stderr"))?;
     let (sender, mut receiver) = mpsc::channel(64);
 
     tokio::spawn(read_lines(stdout, StreamSource::Stdout, sender.clone()));
@@ -361,18 +466,38 @@ where
     drop(sender);
 
     let mut pipe_error = None;
-    while let Some(line) = receiver.recv().await {
-        if pipe_line(&line)
-            && pipe_error.is_none()
-            && let Err(error) = consumer_stdin
-                .write_all(format!("{}\n", line.line).as_bytes())
-                .await
-        {
-            pipe_error = Some(error);
+    let mut read_error = None;
+    let mut callback_error = None;
+    while let Some(message) = receiver.recv().await {
+        let line = match message {
+            StreamMessage::Event(StreamEvent::Line(line)) => line,
+            StreamMessage::Event(StreamEvent::Resize) => continue,
+            StreamMessage::ReadError { source, error } => {
+                read_error.get_or_insert((source, error));
+                continue;
+            }
+        };
+        if pipe_line(&line) && pipe_error.is_none() {
+            let mut text = line.line.clone();
+            text.push('\n');
+            if let Err(error) = consumer_stdin.write_all(text.as_bytes()).await {
+                pipe_error = Some(error);
+            }
         }
-        on_line(line);
+        if let Err(error) = on_line(line) {
+            callback_error = Some(error);
+            break;
+        }
     }
     drop(consumer_stdin);
+
+    if let Some(error) = callback_error {
+        let _ = producer_child.kill().await;
+        let _ = consumer_child.kill().await;
+        let _ = producer_child.wait().await;
+        let _ = consumer_child.wait().await;
+        return Err(error);
+    }
 
     let producer_status = producer_child
         .wait()
@@ -385,6 +510,9 @@ where
 
     let producer_code = producer_status.code().unwrap_or(1);
     let consumer_code = consumer_status.code().unwrap_or(1);
+    if let Some((source, error)) = read_error {
+        return Err(read_error_for(producer, source, error));
+    }
     if producer_code == 0 {
         if let Some(error) = pipe_error
             && consumer_code == 0
@@ -408,7 +536,7 @@ where
     Ok(producer_code)
 }
 
-async fn read_lines<R>(reader: R, source: StreamSource, sender: mpsc::Sender<StreamLine>)
+async fn read_lines<R>(reader: R, source: StreamSource, sender: mpsc::Sender<StreamMessage>)
 where
     R: AsyncRead + Unpin,
 {
@@ -416,17 +544,29 @@ where
     loop {
         match reader.next_line().await {
             Ok(Some(line)) => {
-                if sender.send(StreamLine { source, line }).await.is_err() {
+                if sender
+                    .send(StreamMessage::Event(StreamEvent::Line(StreamLine {
+                        source,
+                        line,
+                    })))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             Ok(None) => break,
-            Err(_) => break,
+            Err(error) => {
+                let _ = sender
+                    .send(StreamMessage::ReadError { source, error })
+                    .await;
+                break;
+            }
         }
     }
 }
 
-async fn read_chunks<R>(mut reader: R, source: StreamSource, sender: mpsc::Sender<StreamChunk>)
+async fn read_chunks<R>(mut reader: R, source: StreamSource, sender: mpsc::Sender<ChunkMessage>)
 where
     R: AsyncRead + Unpin,
 {
@@ -436,17 +576,20 @@ where
             Ok(0) => break,
             Ok(length) => {
                 if sender
-                    .send(StreamChunk {
+                    .send(ChunkMessage::Chunk(StreamChunk {
                         source,
                         bytes: buffer[..length].to_vec(),
-                    })
+                    }))
                     .await
                     .is_err()
                 {
                     break;
                 }
             }
-            Err(_) => break,
+            Err(error) => {
+                let _ = sender.send(ChunkMessage::ReadError { source, error }).await;
+                break;
+            }
         }
     }
 }
@@ -464,6 +607,35 @@ fn write_passthrough(source: StreamSource, bytes: &[u8]) {
             let _ = stderr.flush();
         }
     }
+}
+
+#[cfg(unix)]
+type ResizeSignal = tokio::signal::unix::Signal;
+
+#[cfg(not(unix))]
+struct ResizeSignal;
+
+#[cfg(unix)]
+fn resize_signal() -> Option<ResizeSignal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok()
+}
+
+#[cfg(not(unix))]
+fn resize_signal() -> Option<ResizeSignal> {
+    None
+}
+
+#[cfg(unix)]
+async fn recv_resize(signal: &mut Option<ResizeSignal>) -> bool {
+    let Some(signal) = signal else {
+        return std::future::pending::<bool>().await;
+    };
+    signal.recv().await.is_some()
+}
+
+#[cfg(not(unix))]
+async fn recv_resize(_signal: &mut Option<ResizeSignal>) -> bool {
+    std::future::pending::<bool>().await
 }
 
 fn command_builder(command: &CommandSpec) -> Command {
@@ -495,6 +667,24 @@ fn spawn_error(command: &CommandSpec, source: io::Error) -> NrError {
     }
 }
 
+fn missing_pipe(command: &CommandSpec, stream: &str) -> NrError {
+    NrError::Io {
+        context: format!("failed to capture {stream} from {}", command.render()),
+        source: io::Error::other(format!("{stream} pipe was not available")),
+    }
+}
+
+fn read_error_for(command: &CommandSpec, source: StreamSource, error: io::Error) -> NrError {
+    let stream = match source {
+        StreamSource::Stdout => "stdout",
+        StreamSource::Stderr => "stderr",
+    };
+    NrError::Io {
+        context: format!("failed to read {stream} from {}", command.render()),
+        source: error,
+    }
+}
+
 #[derive(Debug)]
 pub struct LogFile {
     path: PathBuf,
@@ -515,7 +705,7 @@ impl LogFile {
         let file =
             File::create(&path).with_context(format!("failed to create {}", path.display()))?;
         if rotate && let Some(parent) = path.parent() {
-            rotate_logs(parent, 20)?;
+            rotate_logs(parent, 20, &path)?;
         }
         Ok(Self {
             path,
@@ -572,16 +762,20 @@ pub fn state_dir() -> PathBuf {
     root.join("nr")
 }
 
-fn rotate_logs(directory: &Path, keep: usize) -> Result<()> {
+fn rotate_logs(directory: &Path, keep: usize, current_log: &Path) -> Result<()> {
     let mut logs = Vec::new();
-    for entry in fs::read_dir(directory)
-        .with_context(format!(
-            "failed to read log directory {}",
+    for entry in fs::read_dir(directory).with_context(format!(
+        "failed to read log directory {}",
+        directory.display()
+    ))? {
+        let entry = entry.with_context(format!(
+            "failed to read log directory entry in {}",
             directory.display()
-        ))?
-        .flatten()
-    {
+        ))?;
         let path = entry.path();
+        if path == current_log {
+            continue;
+        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
@@ -594,7 +788,7 @@ fn rotate_logs(directory: &Path, keep: usize) -> Result<()> {
         }
     }
     logs.sort_by_key(|(modified, _)| *modified);
-    let remove_count = logs.len().saturating_sub(keep);
+    let remove_count = logs.len().saturating_sub(keep.saturating_sub(1));
     for (_, path) in logs.into_iter().take(remove_count) {
         fs::remove_file(&path).with_context(format!("failed to remove {}", path.display()))?;
     }
@@ -603,4 +797,29 @@ fn rotate_logs(directory: &Path, keep: usize) -> Result<()> {
 
 pub fn os_str(value: &Path) -> &OsStr {
     value.as_os_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::Duration;
+
+    use super::rotate_logs;
+
+    #[test]
+    fn log_rotation_preserves_current_log_even_when_oldest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current = temp.path().join("nr-current.log");
+        fs::write(&current, "current\n").expect("write current");
+        std::thread::sleep(Duration::from_millis(5));
+        for index in 0..25 {
+            fs::write(temp.path().join(format!("nr-old-{index}.log")), "old\n")
+                .expect("write old log");
+        }
+
+        rotate_logs(temp.path(), 20, &current).expect("rotate logs");
+
+        assert!(current.is_file());
+        assert_eq!(fs::read_dir(temp.path()).expect("read logs").count(), 20);
+    }
 }

@@ -41,6 +41,22 @@ fn internal_json_ignores_unknown_fields() {
 }
 
 #[test]
+fn internal_json_tolerates_changed_known_field_shapes() {
+    let line = r#"@nix {"action":"start","id":"7","type":"105","fields":{"message":"building '/nix/store/aaa-linux.drv'"}}"#;
+    let ParsedLine::Event(event) = parse_line(line) else {
+        panic!("expected event");
+    };
+
+    assert_eq!(event.action, "start");
+    assert_eq!(event.id, Some(7));
+    assert_eq!(event.activity_type, Some(105));
+    assert_eq!(
+        event.text,
+        r#"{"message":"building '/nix/store/aaa-linux.drv'"}"#
+    );
+}
+
+#[test]
 fn categorizes_modern_wayland_desktop_stack() {
     assert_eq!(categorize("building niri"), BuildCategory::DesktopStack);
     assert_eq!(

@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::Instant;
 
-use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -360,19 +359,6 @@ impl DependencyGraph {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RawNixEvent {
-    action: Option<String>,
-    id: Option<u64>,
-    parent: Option<u64>,
-    #[serde(rename = "type")]
-    activity_type: Option<u64>,
-    level: Option<u64>,
-    text: Option<String>,
-    msg: Option<String>,
-    fields: Option<Vec<Value>>,
-}
-
 pub fn parse_line(line: &str) -> ParsedLine {
     let trimmed = line.trim_start();
     let (json_text, internal) = if let Some(rest) = trimmed.strip_prefix("@nix ") {
@@ -383,36 +369,56 @@ pub fn parse_line(line: &str) -> ParsedLine {
         return ParsedLine::Plain(line.to_string());
     };
 
-    let raw = match serde_json::from_str::<RawNixEvent>(json_text) {
+    let raw = match serde_json::from_str::<Value>(json_text) {
         Ok(raw) => raw,
         Err(_) if internal => return ParsedLine::BrokenInternalJson(line.to_string()),
         Err(_) => return ParsedLine::Plain(line.to_string()),
     };
-    let fields = raw
-        .fields
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| match value {
-            Value::String(value) => value,
-            other => other.to_string(),
-        })
-        .collect::<Vec<_>>();
-    let text = raw
-        .text
-        .or(raw.msg)
+    let fields = raw_fields(&raw);
+    let text = raw_string(&raw, "text")
+        .or_else(|| raw_string(&raw, "msg"))
         .or_else(|| fields.first().cloned())
         .unwrap_or_default();
 
     ParsedLine::Event(NixEvent {
-        action: raw.action.unwrap_or_else(|| "unknown".to_string()),
-        id: raw.id,
-        parent: raw.parent,
-        activity_type: raw.activity_type,
-        level: raw.level,
+        action: raw_string(&raw, "action").unwrap_or_else(|| "unknown".to_string()),
+        id: raw_u64(&raw, "id"),
+        parent: raw_u64(&raw, "parent"),
+        activity_type: raw_u64(&raw, "type"),
+        level: raw_u64(&raw, "level"),
         text,
         fields,
         raw: json_text.to_string(),
     })
+}
+
+fn raw_string(raw: &Value, key: &str) -> Option<String> {
+    raw.get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn raw_u64(raw: &Value, key: &str) -> Option<u64> {
+    raw.get(key).and_then(|value| match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    })
+}
+
+fn raw_fields(raw: &Value) -> Vec<String> {
+    match raw.get("fields") {
+        Some(Value::Array(fields)) => fields.iter().map(field_text).collect(),
+        Some(field) => vec![field_text(field)],
+        None => Vec::new(),
+    }
+}
+
+fn field_text(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
 }
 
 pub fn categorize(text: &str) -> BuildCategory {

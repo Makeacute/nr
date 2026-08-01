@@ -93,6 +93,7 @@ pub struct Renderer {
     accent: Option<AccentColor>,
     last_rich_render: Instant,
     last_rich_lines: usize,
+    last_rich_width: Option<usize>,
 }
 
 impl Renderer {
@@ -102,6 +103,7 @@ impl Renderer {
             accent: None,
             last_rich_render: Instant::now() - Duration::from_secs(1),
             last_rich_lines: 0,
+            last_rich_width: None,
         }
     }
 
@@ -111,6 +113,7 @@ impl Renderer {
             accent: accent.and_then(|value| AccentColor::parse(&value)),
             last_rich_render: Instant::now() - Duration::from_secs(1),
             last_rich_lines: 0,
+            last_rich_width: None,
         }
     }
 
@@ -189,6 +192,12 @@ impl Renderer {
         }
     }
 
+    pub fn resize(&mut self, state: &BuildState) {
+        if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
+            self.render_rich_state_now(state);
+        }
+    }
+
     pub fn diff(&mut self, diff: &ClosureDiff) {
         match self.mode {
             OutputMode::Json => {}
@@ -261,11 +270,23 @@ impl Renderer {
     }
 
     fn render_rich_state(&mut self, state: &BuildState) {
-        if self.last_rich_render.elapsed() < Duration::from_millis(500) {
+        let width = terminal_width();
+        if self.last_rich_render.elapsed() < Duration::from_millis(500)
+            && self.last_rich_width == Some(width)
+        {
             return;
         }
+        self.render_rich_state_at_width(state, width);
+    }
+
+    fn render_rich_state_now(&mut self, state: &BuildState) {
+        self.render_rich_state_at_width(state, terminal_width());
+    }
+
+    fn render_rich_state_at_width(&mut self, state: &BuildState, width: usize) {
         self.last_rich_render = Instant::now();
-        let lines = build_graph_lines(state, terminal_width());
+        self.last_rich_width = Some(width);
+        let lines = build_graph_lines(state, width);
         self.clear_rich_block();
         for line in &lines {
             println!("{line}");

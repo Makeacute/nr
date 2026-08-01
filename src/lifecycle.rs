@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 
 use crate::backend;
 use crate::cli::{Cli, DiffArgs, GcArgs, RollbackArgs, UpdateArgs};
@@ -21,8 +24,8 @@ use crate::impact::{
     resolve_result_link,
 };
 use crate::process::{
-    CommandSpec, LogFile, RunOutput, StreamLine, run_capture, run_capture_interactive, run_inherit,
-    stream_command, stream_command_to_command,
+    CommandSpec, LogFile, RunOutput, StreamEvent, StreamLine, run_capture, run_capture_interactive,
+    run_inherit, stream_command, stream_command_events, stream_command_to_command,
 };
 use crate::prompts::confirm;
 use crate::ui::{OutputMode, RebuildHeader, RebuildReport, Renderer};
@@ -246,8 +249,21 @@ pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32
 
 pub fn run_rollback(cli: &Cli, args: &RollbackArgs) -> Result<i32> {
     let options = rollback_backend_options(cli, &args.backend_args);
-    let generations = load_system_generations().unwrap_or_default();
-    let pins = load_pins().unwrap_or_default();
+    let generations = match load_system_generations() {
+        Ok(generations) => generations,
+        Err(error) => {
+            eprintln!("warning: failed to inspect system generations: {error}");
+            Vec::new()
+        }
+    };
+    let pins = match load_pins() {
+        Ok(pins) => pins,
+        Err(error) if args.target.is_none() => {
+            eprintln!("warning: failed to read generation pins: {error}");
+            Default::default()
+        }
+        Err(error) => return Err(error),
+    };
     let target_generation = if let Some(target) = &args.target {
         Some(resolve_generation_reference(target, &pins)?)
     } else {
@@ -543,6 +559,7 @@ fn stream_nix_build(
 ) -> Result<BuildRun> {
     log.write_command(command)?;
     let mut state = BuildState::default();
+    let mut graph_loader = DependencyGraphLoader::new();
     let mut fallback_announced = false;
     let announce = should_announce_backend(renderer);
     let code = if renderer.mode() == OutputMode::Nom {
@@ -558,26 +575,38 @@ fn stream_nix_build(
                     &line,
                     log,
                     renderer,
+                    &mut graph_loader,
                     &mut fallback_announced,
-                    false,
-                    false,
-                );
+                    IngestOptions {
+                        load_dependency_graph: false,
+                        render_backend: false,
+                    },
+                )
             },
             pipe_line_to_nom,
         )?
     } else {
-        stream_command(command, announce, |line| {
-            ingest_build_line(
+        stream_command_events(command, announce, |event| match event {
+            StreamEvent::Line(line) => ingest_build_line(
                 &mut state,
                 &line,
                 log,
                 renderer,
+                &mut graph_loader,
                 &mut fallback_announced,
-                true,
-                true,
-            );
+                IngestOptions {
+                    load_dependency_graph: true,
+                    render_backend: true,
+                },
+            ),
+            StreamEvent::Resize => {
+                graph_loader.drain(&mut state, log)?;
+                renderer.resize(&state);
+                Ok(())
+            }
         })?
     };
+    graph_loader.finish(&mut state, log)?;
     Ok(BuildRun { code, state })
 }
 
@@ -640,38 +669,38 @@ fn ingest_build_line(
     line: &StreamLine,
     log: &mut LogFile,
     renderer: &mut Renderer,
+    graph_loader: &mut DependencyGraphLoader,
     fallback_announced: &mut bool,
-    load_dependency_graph: bool,
-    render_backend: bool,
-) {
-    let _ = log.write_line(line.source, &line.line);
-    if load_dependency_graph {
-        learn_dependency_graphs(state, &line.line, log);
+    options: IngestOptions,
+) -> Result<()> {
+    log.write_line(line.source, &line.line)?;
+    if options.load_dependency_graph {
+        graph_loader.note_text(state, &line.line, log)?;
     } else {
         state.note_derivation_paths_from_text(&line.line);
     }
     if state.parser_fallback {
-        if render_backend {
+        if options.render_backend {
             renderer.backend_line(line);
         }
-        return;
+        return Ok(());
     }
     match parse_line(&line.line) {
         ParsedLine::Event(event) => {
             state.ingest(&event);
             for field in &event.fields {
-                if load_dependency_graph {
-                    learn_dependency_graphs(state, field, log);
+                if options.load_dependency_graph {
+                    graph_loader.note_text(state, field, log)?;
                 } else {
                     state.note_derivation_paths_from_text(field);
                 }
             }
-            if render_backend {
+            if options.render_backend {
                 renderer.nix_event(&event, state);
             }
         }
         ParsedLine::Plain(_) => {
-            if render_backend {
+            if options.render_backend {
                 renderer.backend_line(line);
             }
         }
@@ -681,35 +710,108 @@ fn ingest_build_line(
                 renderer.parser_fallback();
                 *fallback_announced = true;
             }
-            if render_backend {
+            if options.render_backend {
                 renderer.backend_line(line);
             }
         }
     }
+    graph_loader.drain(state, log)?;
+    Ok(())
 }
 
-fn learn_dependency_graphs(state: &mut BuildState, text: &str, log: &mut LogFile) {
-    state.note_derivation_paths_from_text(text);
-    for root in state.dependency_graph_roots_to_load() {
-        let command = backend::nix_store_query_graph_command(&root);
-        let _ = log.write_command(&command);
-        match run_capture(&command, false) {
-            Ok(output) if output.code == 0 => {
-                let _ = log.write_output(&output);
-                state.note_derivation_graph(&root, &output.stdout);
+struct DependencyGraphLoader {
+    sender: mpsc::Sender<GraphLoadResult>,
+    receiver: mpsc::Receiver<GraphLoadResult>,
+    queued: BTreeSet<String>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+struct GraphLoadResult {
+    root: String,
+    output: Result<RunOutput>,
+}
+
+impl DependencyGraphLoader {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver,
+            queued: BTreeSet::new(),
+            handles: Vec::new(),
+        }
+    }
+
+    fn note_text(&mut self, state: &mut BuildState, text: &str, log: &mut LogFile) -> Result<()> {
+        state.note_derivation_paths_from_text(text);
+        self.queue_roots(state, log)
+    }
+
+    fn queue_roots(&mut self, state: &mut BuildState, log: &mut LogFile) -> Result<()> {
+        for root in state.dependency_graph_roots_to_load() {
+            if !self.queued.insert(root.clone()) {
+                continue;
             }
-            Ok(output) => {
-                let _ = log.write_output(&output);
-                state.mark_derivation_graph_attempted(&root);
-            }
-            Err(error) => {
-                let _ = log.write_line(
+            state.mark_derivation_graph_attempted(&root);
+            let command = backend::nix_store_query_graph_command(&root);
+            log.write_command(&command)?;
+            let sender = self.sender.clone();
+            self.handles.push(thread::spawn(move || {
+                let output = run_capture(&command, false);
+                let _ = sender.send(GraphLoadResult { root, output });
+            }));
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self, state: &mut BuildState, log: &mut LogFile) -> Result<()> {
+        while let Ok(result) = self.receiver.try_recv() {
+            self.apply_result(state, log, result)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, state: &mut BuildState, log: &mut LogFile) -> Result<()> {
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                log.write_line(
                     crate::process::StreamSource::Stderr,
-                    &format!("failed to load derivation graph for {root}: {error}"),
-                );
-                state.mark_derivation_graph_attempted(&root);
+                    "failed to join derivation graph loader thread",
+                )?;
             }
         }
+        while let Ok(result) = self.receiver.try_recv() {
+            self.apply_result(state, log, result)?;
+        }
+        Ok(())
+    }
+
+    fn apply_result(
+        &mut self,
+        state: &mut BuildState,
+        log: &mut LogFile,
+        result: GraphLoadResult,
+    ) -> Result<()> {
+        self.queued.remove(&result.root);
+        match result.output {
+            Ok(output) if output.code == 0 => {
+                log.write_output(&output)?;
+                state.note_derivation_graph(&result.root, &output.stdout);
+            }
+            Ok(output) => {
+                log.write_output(&output)?;
+            }
+            Err(error) => {
+                log.write_line(
+                    crate::process::StreamSource::Stderr,
+                    &format!(
+                        "failed to load derivation graph for {}: {error}",
+                        result.root
+                    ),
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -719,8 +821,9 @@ fn stream_plain_command(
     renderer: &mut Renderer,
 ) -> Result<i32> {
     stream_command(command, should_announce_backend(renderer), |line| {
-        let _ = log.write_line(line.source, &line.line);
+        log.write_line(line.source, &line.line)?;
         renderer.backend_line(&line);
+        Ok(())
     })
 }
 
@@ -851,6 +954,12 @@ fn running_as_root() -> bool {
 
 fn pipe_line_to_nom(line: &StreamLine) -> bool {
     line.line.trim_start().starts_with("@nix ")
+}
+
+#[derive(Clone, Copy)]
+struct IngestOptions {
+    load_dependency_graph: bool,
+    render_backend: bool,
 }
 
 struct ReportContext<'a> {
