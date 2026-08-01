@@ -19,6 +19,7 @@ impl FlakeTarget {
 }
 
 pub type CheckCommand = Vec<String>;
+pub type HookCommand = Vec<String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckSettings {
@@ -56,11 +57,23 @@ impl Default for PublishSettings {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HookSettings {
+    pub post_switch: Vec<HookCommand>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UiSettings {
+    pub accent: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NrConfig {
     pub target: FlakeTarget,
     pub check: CheckSettings,
     pub publish: PublishSettings,
+    pub hooks: HookSettings,
+    pub ui: UiSettings,
     pub user_config_path: Option<PathBuf>,
     pub repo_config_path: Option<PathBuf>,
 }
@@ -80,6 +93,8 @@ struct ConfigData {
     target: TargetConfig,
     check: CheckConfig,
     publish: PublishConfig,
+    hooks: HooksConfig,
+    ui: UiConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -104,6 +119,18 @@ struct CheckConfig {
 #[serde(default, deny_unknown_fields)]
 struct PublishConfig {
     remote: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HooksConfig {
+    post_switch: Option<Vec<HookCommand>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UiConfig {
+    accent: Option<String>,
 }
 
 pub fn find_flake(start: &Path) -> Option<PathBuf> {
@@ -252,13 +279,19 @@ fn finish_config(
 
     let mut check = CheckSettings::default();
     let mut publish = PublishSettings::default();
+    let mut hooks = HookSettings::default();
+    let mut ui = UiSettings::default();
     if let Some(data) = &user_data {
         check = merge_check_settings(check, data);
         publish = merge_publish_settings(publish, data)?;
+        hooks = merge_hook_settings(hooks, data);
+        ui = merge_ui_settings(ui, data)?;
     }
     if let Some(data) = &repo_data {
         check = merge_check_settings(check, data);
         publish = merge_publish_settings(publish, data)?;
+        hooks = merge_hook_settings(hooks, data);
+        ui = merge_ui_settings(ui, data)?;
     }
 
     Ok(NrConfig {
@@ -268,6 +301,8 @@ fn finish_config(
         },
         check,
         publish,
+        hooks,
+        ui,
         user_config_path: user_data.as_ref().map(|_| user_path),
         repo_config_path: repo_data.as_ref().map(|_| repo_path),
     })
@@ -352,6 +387,33 @@ fn merge_publish_settings(mut base: PublishSettings, data: &ConfigData) -> Resul
         base.remote = remote;
     }
     Ok(base)
+}
+
+fn merge_hook_settings(mut base: HookSettings, data: &ConfigData) -> HookSettings {
+    if let Some(commands) = &data.hooks.post_switch {
+        base.post_switch = commands.clone();
+    }
+    base
+}
+
+fn merge_ui_settings(mut base: UiSettings, data: &ConfigData) -> Result<UiSettings> {
+    if let Some(accent) = &data.ui.accent {
+        let accent = accent.trim();
+        if !is_hex_color(accent) {
+            return Err(NrError::message(
+                "[ui].accent must be a hex color like \"#cba6f7\".",
+            ));
+        }
+        base.accent = Some(accent.to_string());
+    }
+    Ok(base)
+}
+
+fn is_hex_color(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix('#') else {
+        return false;
+    };
+    hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn resolve_config_path(

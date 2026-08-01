@@ -5,6 +5,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod errors;
 pub mod events;
+pub mod generations;
 pub mod git;
 pub mod help;
 pub mod impact;

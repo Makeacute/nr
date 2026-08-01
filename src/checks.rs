@@ -5,7 +5,7 @@ use crate::backend::{self, BackendOptions};
 use crate::cli::{CheckArgs, Cli};
 use crate::config::{CheckSettings, NrConfig};
 use crate::errors::{NrError, Result};
-use crate::process::{CommandSpec, render_command, run_inherit};
+use crate::process::{CommandSpec, RunOutput, render_command, run_capture};
 
 const EXCLUDED_DIRECTORIES: &[&str] = &[
     ".cache",
@@ -27,10 +27,16 @@ pub fn run_check(cli: &Cli, config: &NrConfig, args: &CheckArgs) -> Result<i32> 
 
     let mut failed = Vec::new();
     for (name, command) in checks {
-        println!("\n[{name}]");
-        let code = run_inherit(&command, true)?;
-        if code != 0 {
-            failed.push(name);
+        println!("\n[{name}] {}", command.render());
+        let output = run_capture(&command, false)?;
+        if output.code == 0 {
+            println!("passed");
+        } else {
+            failed.push(CheckFailure {
+                name,
+                command,
+                output,
+            });
         }
     }
 
@@ -38,11 +44,38 @@ pub fn run_check(cli: &Cli, config: &NrConfig, args: &CheckArgs) -> Result<i32> 
         println!("\nAll checks passed.");
         Ok(0)
     } else {
-        eprintln!("\nFailed checks: {}", failed.join(", "));
+        eprintln!("\nFailed checks:");
+        for failure in &failed {
+            print_check_failure(failure);
+        }
         Err(NrError::CommandFailed {
             command: "nr check".to_string(),
             code: 1,
         })
+    }
+}
+
+struct CheckFailure {
+    name: String,
+    command: CommandSpec,
+    output: RunOutput,
+}
+
+fn print_check_failure(failure: &CheckFailure) {
+    eprintln!("\n[{}] exited with {}", failure.name, failure.output.code);
+    eprintln!("command: {}", failure.command.render());
+    print_stream_block("stdout", &failure.output.stdout);
+    print_stream_block("stderr", &failure.output.stderr);
+}
+
+fn print_stream_block(label: &str, text: &str) {
+    if text.trim().is_empty() {
+        eprintln!("{label}: <empty>");
+    } else {
+        eprintln!("{label}:");
+        for line in text.lines() {
+            eprintln!("  {line}");
+        }
     }
 }
 

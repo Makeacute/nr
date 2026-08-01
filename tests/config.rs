@@ -3,8 +3,8 @@ mod support;
 use std::fs;
 
 use nr::config::{
-    CheckSettings, ConfigInput, FlakeTarget, load_config, split_flake_reference,
-    validate_flake_path,
+    CheckSettings, ConfigInput, FlakeTarget, HookSettings, UiSettings, load_config,
+    split_flake_reference, validate_flake_path,
 };
 
 #[test]
@@ -32,7 +32,7 @@ fn load_config_precedence_and_repo_overrides() {
     fs::write(
         xdg.join("nr/config.toml"),
         format!(
-            r#"
+            r##"
 [target]
 flake = "{}"
 host = "user-host"
@@ -46,7 +46,13 @@ commands = [
 
 [publish]
 remote = "upstream"
-"#,
+
+[hooks]
+post_switch = [["systemctl", "--user", "restart", "waybar.service"]]
+
+[ui]
+accent = "#cba6f7"
+"##,
             user_flake.display()
         ),
     )
@@ -113,6 +119,23 @@ statix = true
         }
     );
     assert_eq!(config.publish.remote, "upstream");
+    assert_eq!(
+        config.hooks,
+        HookSettings {
+            post_switch: vec![vec![
+                "systemctl".to_string(),
+                "--user".to_string(),
+                "restart".to_string(),
+                "waybar.service".to_string(),
+            ]],
+        }
+    );
+    assert_eq!(
+        config.ui,
+        UiSettings {
+            accent: Some("#cba6f7".to_string()),
+        }
+    );
 }
 
 #[test]
@@ -156,4 +179,39 @@ typo = true
     .to_string();
 
     assert!(error.contains("unknown field"));
+}
+
+#[test]
+fn config_rejects_invalid_ui_accent() {
+    let temp = support::TestDir::new();
+    let flake = support::make_flake(&temp.path().join("flake"));
+    let xdg = temp.path().join("xdg");
+    fs::create_dir_all(xdg.join("nr")).unwrap();
+    fs::write(
+        xdg.join("nr/config.toml"),
+        format!(
+            r##"
+[target]
+flake = "{}"
+
+[ui]
+accent = "purple"
+"##,
+            flake.display()
+        ),
+    )
+    .unwrap();
+
+    let error = load_config(ConfigInput {
+        cwd: Some(temp.path().to_path_buf()),
+        environ: Some(vec![(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg.display().to_string(),
+        )]),
+        ..ConfigInput::default()
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("[ui].accent"));
 }

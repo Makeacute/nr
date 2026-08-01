@@ -29,6 +29,18 @@ fn parses_internal_json_without_failing_unknown_events() {
 }
 
 #[test]
+fn internal_json_ignores_unknown_fields() {
+    let line = r#"@nix {"action":"start","id":7,"type":105,"text":"building '/nix/store/aaa-linux.drv'","newField":{"shape":true}}"#;
+    let ParsedLine::Event(event) = parse_line(line) else {
+        panic!("expected event");
+    };
+
+    assert_eq!(event.action, "start");
+    assert_eq!(event.id, Some(7));
+    assert_eq!(event.text, "building '/nix/store/aaa-linux.drv'");
+}
+
+#[test]
 fn categorizes_modern_wayland_desktop_stack() {
     assert_eq!(categorize("building niri"), BuildCategory::DesktopStack);
     assert_eq!(

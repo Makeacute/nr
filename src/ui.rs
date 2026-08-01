@@ -90,6 +90,7 @@ pub struct RebuildReport {
 
 pub struct Renderer {
     mode: OutputMode,
+    accent: Option<AccentColor>,
     last_rich_render: Instant,
     last_rich_lines: usize,
 }
@@ -98,14 +99,16 @@ impl Renderer {
     pub fn new(mode: OutputMode) -> Self {
         Self {
             mode: mode.effective(),
+            accent: None,
             last_rich_render: Instant::now() - Duration::from_secs(1),
             last_rich_lines: 0,
         }
     }
 
-    pub fn new_for_lifecycle(mode: OutputMode, action: &str) -> Self {
+    pub fn new_for_lifecycle(mode: OutputMode, action: &str, accent: Option<String>) -> Self {
         Self {
             mode: mode.effective_for_lifecycle(action),
+            accent: accent.and_then(|value| AccentColor::parse(&value)),
             last_rich_render: Instant::now() - Duration::from_secs(1),
             last_rich_lines: 0,
         }
@@ -118,14 +121,17 @@ impl Renderer {
                 eprintln!("nr {} {}", header.command, header.target.reference());
             }
             OutputMode::Plain => {
-                println!("nr {} {}", header.command, header.target.reference());
+                println!("◆ nr {} {}", header.command, header.target.reference());
                 print_header_details(header);
             }
             OutputMode::Rich | OutputMode::Nom | OutputMode::Auto => {
                 println!(
-                    "\x1b[1;36mnr {}\x1b[0m {}",
-                    header.command,
-                    header.target.reference()
+                    "{}",
+                    self.accent_line(&format!(
+                        "◆ nr {} {}",
+                        header.command,
+                        header.target.reference()
+                    ))
                 );
                 print_header_details(header);
             }
@@ -135,11 +141,11 @@ impl Renderer {
     pub fn phase(&mut self, phase: &str) {
         match self.mode {
             OutputMode::Json | OutputMode::Raw => {}
-            OutputMode::Plain => println!("phase: {phase}"),
-            OutputMode::Nom => println!("\x1b[1;34m{phase}\x1b[0m"),
+            OutputMode::Plain => println!("▶ {phase}"),
+            OutputMode::Nom => println!("{}", self.accent_line(&format!("▶ {phase}"))),
             OutputMode::Rich | OutputMode::Auto => {
                 self.clear_rich_block();
-                println!("\x1b[1;34m{phase}\x1b[0m");
+                println!("{}", self.accent_line(&format!("▶ {phase}")));
             }
         }
     }
@@ -225,22 +231,33 @@ impl Renderer {
                 if matches!(self.mode, OutputMode::Rich | OutputMode::Auto) {
                     self.clear_rich_block();
                 }
-                println!("result: {}", report.result);
+                println!("✓ result: {}", report.result);
                 if let Some(path) = &report.store_path {
-                    println!("store path: {}", path.display());
+                    println!("▣ store path: {}", path.display());
                 }
                 if let Some(generation) = report.new_generation {
-                    println!("generation: {generation}");
+                    println!("№ generation: {generation}");
                 }
-                println!("reboot: {}", report.reboot);
-                println!("rollback: {}", report.rollback);
-                println!("log: {}", report.log_path.display());
+                println!("↻ reboot: {}", report.reboot);
+                println!("↶ rollback: {}", report.rollback);
+                println!("▣ log: {}", report.log_path.display());
             }
         }
     }
 
     pub fn mode(&self) -> OutputMode {
         self.mode
+    }
+
+    fn accent_line(&self, text: &str) -> String {
+        if let Some(accent) = self.accent {
+            format!(
+                "\x1b[1;38;2;{};{};{}m{text}\x1b[0m",
+                accent.red, accent.green, accent.blue
+            )
+        } else {
+            format!("\x1b[1;36m{text}\x1b[0m")
+        }
     }
 
     fn render_rich_state(&mut self, state: &BuildState) {
@@ -266,6 +283,27 @@ impl Renderer {
         }
         self.last_rich_lines = 0;
         let _ = io::stdout().flush();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AccentColor {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl AccentColor {
+    fn parse(value: &str) -> Option<Self> {
+        let hex = value.strip_prefix('#')?;
+        if hex.len() != 6 {
+            return None;
+        }
+        Some(Self {
+            red: u8::from_str_radix(&hex[0..2], 16).ok()?,
+            green: u8::from_str_radix(&hex[2..4], 16).ok()?,
+            blue: u8::from_str_radix(&hex[4..6], 16).ok()?,
+        })
     }
 }
 
@@ -487,22 +525,22 @@ fn print_header_details(header: &RebuildHeader) {
         let branch = header.git.branch.as_deref().unwrap_or("detached");
         let dirty = if header.git.dirty { "dirty" } else { "clean" };
         println!(
-            "git: {branch} ({dirty}, {} untracked)",
+            "⎇ git: {branch} ({dirty}, {} untracked)",
             header.git.untracked
         );
     } else {
-        println!("git: not a repository");
+        println!("⎇ git: not a repository");
     }
     if let Some(generation) = header.current.generation {
-        println!("current generation: {generation}");
+        println!("№ current generation: {generation}");
     }
     if let Some(version) = &header.current.nixos_version {
-        println!("current NixOS: {version}");
+        println!("◇ current NixOS: {version}");
     }
     if let Some(kernel) = &header.current.kernel_version {
-        println!("current kernel: {kernel}");
+        println!("● current kernel: {kernel}");
     }
-    println!("log: {}", header.log_path.display());
+    println!("▣ log: {}", header.log_path.display());
 }
 
 fn print_diff_summary(diff: &ClosureDiff) {
@@ -733,6 +771,37 @@ digraph G {
 
         assert_eq!(truncated.chars().count(), 12);
         assert!(truncated.contains("..."));
+    }
+
+    #[test]
+    fn graph_lines_reflow_for_different_widths() {
+        let mut state = BuildState {
+            phase: "building".to_string(),
+            ..BuildState::default()
+        };
+        let activity = Activity {
+            id: 1,
+            parent: None,
+            text: "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-package-with-a-long-name.drv'"
+                .to_string(),
+            drv_path: Some(
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-package-with-a-long-name.drv"
+                    .to_string(),
+            ),
+            category: BuildCategory::Other,
+            source_build: true,
+            substitute: false,
+            status: ActivityStatus::Running,
+            started_at: Instant::now(),
+        };
+        state.running.insert(activity.id, activity);
+
+        let narrow = build_graph_lines(&state, 48);
+        let wide = build_graph_lines(&state, 120);
+
+        assert!(narrow.iter().all(|line| line.chars().count() <= 48));
+        assert!(wide.iter().all(|line| line.chars().count() <= 120));
+        assert_ne!(narrow, wide);
     }
 
     #[test]

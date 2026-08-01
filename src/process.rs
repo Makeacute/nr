@@ -1,11 +1,14 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command as TokioCommand;
+use tokio::runtime::Builder;
+use tokio::sync::mpsc;
 
 use crate::errors::{IoContext, NrError, Result};
 
@@ -74,6 +77,11 @@ pub struct RunOutput {
     pub stderr: String,
 }
 
+struct StreamChunk {
+    source: StreamSource,
+    bytes: Vec<u8>,
+}
+
 pub fn render_command(parts: &[String]) -> String {
     let rendered = parts
         .iter()
@@ -130,6 +138,20 @@ pub fn run_capture(command: &CommandSpec, announce: bool) -> Result<RunOutput> {
     })
 }
 
+pub fn run_capture_interactive(
+    command: &CommandSpec,
+    announce: bool,
+    passthrough_stdout: bool,
+    passthrough_stderr: bool,
+) -> Result<RunOutput> {
+    block_on(async_run_capture_interactive(
+        command,
+        announce,
+        passthrough_stdout,
+        passthrough_stderr,
+    ))
+}
+
 pub fn run_checked(command: &CommandSpec, announce: bool) -> Result<RunOutput> {
     let output = run_capture(command, announce)?;
     if output.code != 0 {
@@ -159,33 +181,7 @@ pub fn stream_command<F>(command: &CommandSpec, announce: bool, mut on_line: F) 
 where
     F: FnMut(StreamLine),
 {
-    if announce {
-        println!("-> {}", command.render());
-    }
-
-    let mut child = command_builder(command)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| spawn_error(command, source))?;
-
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let (sender, receiver) = mpsc::channel();
-
-    spawn_reader(stdout, StreamSource::Stdout, sender.clone());
-    spawn_reader(stderr, StreamSource::Stderr, sender.clone());
-    drop(sender);
-
-    for line in receiver {
-        on_line(line);
-    }
-
-    let status = child
-        .wait()
-        .with_context(format!("failed to wait for {}", command.render()))?;
-    Ok(status.code().unwrap_or(1))
+    block_on(async_stream_command(command, announce, &mut on_line))
 }
 
 pub fn stream_command_to_command<F, P>(
@@ -199,11 +195,141 @@ where
     F: FnMut(StreamLine),
     P: FnMut(&StreamLine) -> bool,
 {
+    block_on(async_stream_command_to_command(
+        producer,
+        consumer,
+        announce,
+        &mut on_line,
+        &mut pipe_line,
+    ))
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(|source| NrError::Io {
+            context: "failed to create async runtime".to_string(),
+            source,
+        })?
+        .block_on(future)
+}
+
+async fn async_run_capture_interactive(
+    command: &CommandSpec,
+    announce: bool,
+    passthrough_stdout: bool,
+    passthrough_stderr: bool,
+) -> Result<RunOutput> {
+    if announce {
+        println!("-> {}", command.render());
+    }
+
+    let mut child = tokio_command_builder(command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| spawn_error(command, source))?;
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (sender, mut receiver) = mpsc::channel(64);
+
+    tokio::spawn(read_chunks(stdout, StreamSource::Stdout, sender.clone()));
+    tokio::spawn(read_chunks(stderr, StreamSource::Stderr, sender.clone()));
+    drop(sender);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    while let Some(chunk) = receiver.recv().await {
+        match chunk.source {
+            StreamSource::Stdout => {
+                if passthrough_stdout {
+                    write_passthrough(StreamSource::Stdout, &chunk.bytes);
+                }
+                stdout.extend_from_slice(&chunk.bytes);
+            }
+            StreamSource::Stderr => {
+                if passthrough_stderr {
+                    write_passthrough(StreamSource::Stderr, &chunk.bytes);
+                }
+                stderr.extend_from_slice(&chunk.bytes);
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .with_context(format!("failed to wait for {}", command.render()))?;
+    if passthrough_stdout && !stdout.is_empty() && !stdout.ends_with(b"\n") {
+        println!();
+    }
+    if passthrough_stderr && !stderr.is_empty() && !stderr.ends_with(b"\n") {
+        eprintln!();
+    }
+    Ok(RunOutput {
+        code: status.code().unwrap_or(1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+async fn async_stream_command<F>(
+    command: &CommandSpec,
+    announce: bool,
+    on_line: &mut F,
+) -> Result<i32>
+where
+    F: FnMut(StreamLine),
+{
+    if announce {
+        println!("-> {}", command.render());
+    }
+
+    let mut child = tokio_command_builder(command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| spawn_error(command, source))?;
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (sender, mut receiver) = mpsc::channel(64);
+
+    tokio::spawn(read_lines(stdout, StreamSource::Stdout, sender.clone()));
+    tokio::spawn(read_lines(stderr, StreamSource::Stderr, sender.clone()));
+    drop(sender);
+
+    while let Some(line) = receiver.recv().await {
+        on_line(line);
+    }
+
+    let status = child
+        .wait()
+        .await
+        .with_context(format!("failed to wait for {}", command.render()))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+async fn async_stream_command_to_command<F, P>(
+    producer: &CommandSpec,
+    consumer: &CommandSpec,
+    announce: bool,
+    on_line: &mut F,
+    pipe_line: &mut P,
+) -> Result<i32>
+where
+    F: FnMut(StreamLine),
+    P: FnMut(&StreamLine) -> bool,
+{
     if announce {
         println!("-> {} | {}", producer.render(), consumer.render());
     }
 
-    let mut consumer_child = command_builder(consumer)
+    let mut consumer_child = tokio_command_builder(consumer)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -211,7 +337,7 @@ where
         .map_err(|source| spawn_error(consumer, source))?;
     let mut consumer_stdin = consumer_child.stdin.take().expect("stdin was piped");
 
-    let mut producer_child = match command_builder(producer)
+    let mut producer_child = match tokio_command_builder(producer)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -220,25 +346,27 @@ where
         Ok(child) => child,
         Err(source) => {
             drop(consumer_stdin);
-            let _ = consumer_child.kill();
-            let _ = consumer_child.wait();
+            let _ = consumer_child.kill().await;
+            let _ = consumer_child.wait().await;
             return Err(spawn_error(producer, source));
         }
     };
 
     let stdout = producer_child.stdout.take().expect("stdout was piped");
     let stderr = producer_child.stderr.take().expect("stderr was piped");
-    let (sender, receiver) = mpsc::channel();
+    let (sender, mut receiver) = mpsc::channel(64);
 
-    spawn_reader(stdout, StreamSource::Stdout, sender.clone());
-    spawn_reader(stderr, StreamSource::Stderr, sender.clone());
+    tokio::spawn(read_lines(stdout, StreamSource::Stdout, sender.clone()));
+    tokio::spawn(read_lines(stderr, StreamSource::Stderr, sender.clone()));
     drop(sender);
 
     let mut pipe_error = None;
-    for line in receiver {
+    while let Some(line) = receiver.recv().await {
         if pipe_line(&line)
             && pipe_error.is_none()
-            && let Err(error) = writeln!(consumer_stdin, "{}", line.line)
+            && let Err(error) = consumer_stdin
+                .write_all(format!("{}\n", line.line).as_bytes())
+                .await
         {
             pipe_error = Some(error);
         }
@@ -248,9 +376,11 @@ where
 
     let producer_status = producer_child
         .wait()
+        .await
         .with_context(format!("failed to wait for {}", producer.render()))?;
     let consumer_status = consumer_child
         .wait()
+        .await
         .with_context(format!("failed to wait for {}", consumer.render()))?;
 
     let producer_code = producer_status.code().unwrap_or(1);
@@ -278,39 +408,75 @@ where
     Ok(producer_code)
 }
 
-fn spawn_reader<R>(reader: R, source: StreamSource, sender: mpsc::Sender<StreamLine>)
+async fn read_lines<R>(reader: R, source: StreamSource, sender: mpsc::Sender<StreamLine>)
 where
-    R: io::Read + Send + 'static,
+    R: AsyncRead + Unpin,
 {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    while line.ends_with('\n') || line.ends_with('\r') {
-                        line.pop();
-                    }
-                    if sender
-                        .send(StreamLine {
-                            source,
-                            line: line.clone(),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+    let mut reader = BufReader::new(reader).lines();
+    loop {
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                if sender.send(StreamLine { source, line }).await.is_err() {
+                    break;
                 }
-                Err(_) => break,
             }
+            Ok(None) => break,
+            Err(_) => break,
         }
-    });
+    }
+}
+
+async fn read_chunks<R>(mut reader: R, source: StreamSource, sender: mpsc::Sender<StreamChunk>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0; 4096];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(length) => {
+                if sender
+                    .send(StreamChunk {
+                        source,
+                        bytes: buffer[..length].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn write_passthrough(source: StreamSource, bytes: &[u8]) {
+    match source {
+        StreamSource::Stdout => {
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(bytes);
+            let _ = stdout.flush();
+        }
+        StreamSource::Stderr => {
+            let mut stderr = io::stderr().lock();
+            let _ = stderr.write_all(bytes);
+            let _ = stderr.flush();
+        }
+    }
 }
 
 fn command_builder(command: &CommandSpec) -> Command {
     let mut builder = Command::new(&command.program);
+    builder.args(&command.args);
+    if let Some(cwd) = &command.cwd {
+        builder.current_dir(cwd);
+    }
+    builder
+}
+
+fn tokio_command_builder(command: &CommandSpec) -> TokioCommand {
+    let mut builder = TokioCommand::new(&command.program);
     builder.args(&command.args);
     if let Some(cwd) = &command.cwd {
         builder.current_dir(cwd);
@@ -337,6 +503,7 @@ pub struct LogFile {
 
 impl LogFile {
     pub fn create(path: Option<PathBuf>) -> Result<Self> {
+        let rotate = path.is_none();
         let path = match path {
             Some(path) => path,
             None => default_log_path(),
@@ -347,6 +514,9 @@ impl LogFile {
         }
         let file =
             File::create(&path).with_context(format!("failed to create {}", path.display()))?;
+        if rotate && let Some(parent) = path.parent() {
+            rotate_logs(parent, 20)?;
+        }
         Ok(Self {
             path,
             writer: BufWriter::new(file),
@@ -385,17 +555,50 @@ impl LogFile {
 }
 
 fn default_log_path() -> PathBuf {
-    let root = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(std::env::temp_dir);
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    root.join("nr")
+    state_dir()
         .join("logs")
         .join(format!("nr-{seconds}-{}.log", std::process::id()))
+}
+
+pub fn state_dir() -> PathBuf {
+    let root = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir);
+    root.join("nr")
+}
+
+fn rotate_logs(directory: &Path, keep: usize) -> Result<()> {
+    let mut logs = Vec::new();
+    for entry in fs::read_dir(directory)
+        .with_context(format!(
+            "failed to read log directory {}",
+            directory.display()
+        ))?
+        .flatten()
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("nr-") && name.ends_with(".log") && path.is_file() {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            logs.push((modified, path));
+        }
+    }
+    logs.sort_by_key(|(modified, _)| *modified);
+    let remove_count = logs.len().saturating_sub(keep);
+    for (_, path) in logs.into_iter().take(remove_count) {
+        fs::remove_file(&path).with_context(format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub fn os_str(value: &Path) -> &OsStr {

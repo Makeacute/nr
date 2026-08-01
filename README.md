@@ -18,6 +18,9 @@ nr boot                 Build and make the generation the next boot default
 nr preview              Build, diff, and dry-activate without mutating
 nr rollback             Roll back to the previous generation
 nr generations          Show NixOS generations
+nr diff                 Diff current system against a path, generation, or flake
+nr gc                   Garbage collect old generations older than 7d
+nr pin GEN LABEL        Label a generation for later reference
 nr update               Update flake.lock only
 nr update nixpkgs       Update one flake input
 nr update --switch      Update, build, and activate
@@ -41,7 +44,16 @@ shortened in the terminal; the full backend stream stays in the log file.
 After a successful build, `nr` compares `/run/current-system` to the new system
 with `nix store diff-closures`. For `switch`, `test`, and `preview`, it also
 runs dry activation and summarizes services that would stop, start, restart, or
-reload.
+reload. Build logs are streamed with async I/O, and Nix `internal-json` parsing
+is defensive: unknown fields are ignored and malformed internal JSON falls back
+to plain backend log filtering.
+
+When `switch`, `test`, `boot`, or `rollback` is run by a non-root user from an
+interactive terminal, no extra flag is needed: `nr` asks `nixos-rebuild` to
+prompt for elevation. Use `--elevate sudo`, `--elevate run0`, or `--elevate
+none` only when you want to choose a method explicitly. `preview` stays
+non-mutating; if you want its dry-activation probe to authenticate, run `nr
+preview --ask-elevate-password`.
 
 Output modes:
 
@@ -53,10 +65,59 @@ Output modes:
 --ui raw                Backend output passthrough
 --ui json               Final structured report as JSON
 --log-file PATH         Capture the full backend log at PATH
+--elevate METHOD        Forward nixos-rebuild elevation method: none, sudo, run0
+--ask-elevate-password  Ask for the elevation password during activation
+--notify                Send notify-send notification when lifecycle commands finish
 ```
 
 Without `--log-file`, logs are written under `$XDG_STATE_HOME/nr/logs/` or
-`~/.local/state/nr/logs/`.
+`~/.local/state/nr/logs/`. Default logs rotate automatically; `nr` keeps the
+latest 20 `nr-*.log` files. A user-provided `--log-file` is never rotated.
+
+`tempfile` is used for temporary build result directories for commands that
+should not leave `./result` behind, such as `preview`, `switch`, `test`, `boot`,
+and `diff` builds.
+
+`--ui json` prints a final single-line report. Current shape:
+
+```json
+{
+  "command": "preview",
+  "target": "/etc/nixos#desktop",
+  "result": "preview complete; no activation performed",
+  "store_path": "/nix/store/...",
+  "current_generation": 220,
+  "new_generation": null,
+  "reboot": "no reboot requirement detected",
+  "rollback": "nr rollback",
+  "log_path": "/home/user/.local/state/nr/logs/nr-...",
+  "build": {
+    "completed": 12,
+    "failed": 0,
+    "running": 0,
+    "downloads": 2,
+    "source_builds": 1,
+    "binary_substitutes": 11,
+    "parser_fallback": false
+  },
+  "diff": {
+    "additions": 0,
+    "removals": 0,
+    "upgrades": 3,
+    "downgrades": 0,
+    "important": ["linux: 6.18.39 -> 6.18.40"]
+  },
+  "activation": {
+    "stopped": [],
+    "started": [],
+    "restarted": ["sshd.service"],
+    "reloaded": [],
+    "skipped": [],
+    "failed": [],
+    "unavailable": null
+  }
+}
+```
 
 ## Flake Discovery
 
@@ -95,10 +156,18 @@ commands = [
 
 [publish]
 remote = "origin"
+
+[hooks]
+post_switch = [
+  ["systemctl", "--user", "restart", "waybar.service"],
+]
+
+[ui]
+accent = "#cba6f7"
 ```
 
 CLI options win over environment variables, repo config, user config, and
-built-in defaults. Custom checks are arrays, not shell strings.
+built-in defaults. Custom checks and hooks are arrays, not shell strings.
 
 ## Safety Model
 
@@ -110,14 +179,26 @@ are invisible to Git flakes.
 `nr preview` is the recommended no-mutation lifecycle command. `--dry` remains
 accepted on lifecycle commands as a preview-style alias.
 
-`rollback` uses the official previous-generation path:
+Build failures stop before activation and preserve the backend exit code.
+Dry-activation failures are fatal for `switch` and `test`, but only reported as
+unavailable in `preview`. Activation and post-switch hook failures preserve the
+failing command exit code. `nr check` groups failed check stdout and stderr by
+check name.
+
+`rollback` without a target uses the official previous-generation path after
+printing the current and target generation:
 
 ```console
 nixos-rebuild switch --rollback
 ```
 
-Targeted rollback by manually editing `/nix/var/nix/profiles/system` is not part
-of v2.
+`nr rollback LABEL` or `nr rollback GEN` activates the named or numbered
+generation via `--store-path`. Labels are created with `nr pin GEN LABEL` and
+stored in `$XDG_STATE_HOME/nr/pins.toml` or `~/.local/state/nr/pins.toml`.
+
+`nr gc` defaults to `nix-collect-garbage --delete-older-than 7d`. Use
+`nr gc --delete-old` for the more aggressive `-d` behavior, and
+`nr gc --dry-run` to preview.
 
 ## Install
 

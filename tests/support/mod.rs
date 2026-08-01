@@ -89,7 +89,21 @@ case "${1:-}" in
     echo "activated ${1:-}"
     ;;
   list-generations)
-    echo "1 current 2026-07-31"
+    case "$*" in
+      *"--json"*)
+        cat <<'JSON'
+[
+  {"generation":2,"date":"2026-08-01 10:00:00","nixosVersion":"26.11","kernelVersion":"6.18.40","configurationRevision":"rev2","specialisations":[],"current":true},
+  {"generation":1,"date":"2026-07-31 10:00:00","nixosVersion":"26.11","kernelVersion":"6.18.39","configurationRevision":"rev1","specialisations":[],"current":false}
+]
+JSON
+        ;;
+      *)
+        echo "Generation  Build-date           NixOS version  Kernel  Configuration Revision  Specialisation  Current"
+        echo "2           2026-08-01 10:00:00  26.11         6.18.40 rev2                    []              True"
+        echo "1           2026-07-31 10:00:00  26.11         6.18.39 rev1                    []              False"
+        ;;
+    esac
     ;;
   *)
     echo "unexpected nixos-rebuild command: $*" >&2
@@ -150,6 +164,54 @@ case "$*" in
     exit 98
     ;;
 esac
+"#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("nix-collect-garbage"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+echo "nix-collect-garbage $*" >> "$NR_FAKE_LOG"
+echo "gc $*"
+"#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("notify-send"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+echo "notify-send $*" >> "$NR_FAKE_LOG"
+"#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("hook-success"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+echo "hook-success $*" >> "$NR_FAKE_LOG"
+echo "hook ran"
+"#,
+        ),
+    )
+    .unwrap();
+
+    write_executable(
+        &bin.join("hook-fail"),
+        &script_with_shell(
+            &shell,
+            r#"set -u
+echo "hook-fail $*" >> "$NR_FAKE_LOG"
+echo "hook failed" >&2
+exit 66
 "#,
         ),
     )

@@ -13,7 +13,12 @@ CORE
   nr boot                  Build and make the generation the next boot default.
   nr preview               Build, diff, and dry-activate without mutating.
   nr rollback              Roll back to the previous generation.
+  nr rollback LABEL        Roll back to a pinned generation label.
   nr generations           Show NixOS generations.
+  nr diff                  Diff current system against a path, generation, or flake.
+  nr gc                    Garbage collect generations older than 7d.
+  nr gc --dry-run          Preview garbage collection.
+  nr pin GEN LABEL         Label a generation for later rollback.
 
 UPDATES AND CHECKS
   nr update                Update flake.lock only.
@@ -45,6 +50,9 @@ COMMON FLAGS
   --ask                    Ask before activation.
   --offline                Forward offline mode to Nix.
   --show-trace             Forward Nix traces.
+  --elevate none|sudo|run0 Forward nixos-rebuild elevation method.
+  --ask-elevate-password   Ask for the elevation password during activation.
+  --notify                 Send a desktop notification when lifecycle commands finish.
   --specialisation NAME    Build or activate a specialisation.
   --                       Pass remaining arguments directly to the backend.
 

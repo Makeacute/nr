@@ -1,4 +1,4 @@
-.TH NR 1 "July 2026" "nr 0.2.1" "User Commands"
+.TH NR 1 "August 2026" "nr 0.3.0" "User Commands"
 .SH NAME
 nr \- Git-aware NixOS lifecycle helper
 .SH SYNOPSIS
@@ -43,11 +43,31 @@ Build into a temporary directory, show the closure diff, and dry-activate
 without mutating bootloader or profile state.
 .TP
 .B rollback
-Run the official previous-generation rollback:
+Show the generation being rolled back to, then roll back. Without an argument,
+runs the official previous-generation rollback:
 .BR "nixos-rebuild switch --rollback" .
+With a generation number or pin label, activates that generation store path.
 .TP
 .B generations
-Show NixOS generations.
+Show NixOS generations, annotated with any
+.B nr pin
+labels.
+.TP
+.B diff
+Diff the current system against a path, generation, or flake. If no
+.B --to
+is provided, builds the selected flake in a temporary directory and diffs
+against it.
+.TP
+.B gc
+Run
+.BR nix-collect-garbage (1)
+with safer defaults. By default, deletes generations older than
+.BR 7d .
+.TP
+.B pin
+Label a NixOS generation in
+.BR "$XDG_STATE_HOME/nr/pins.toml" .
 .TP
 .B update
 Update
@@ -101,6 +121,19 @@ Forward offline mode to Nix.
 .B --show-trace
 Forward Nix traces.
 .TP
+.BI "--elevate " none|sudo|run0
+Forward the
+.BR nixos-rebuild (8)
+privilege-elevation method used by dry activation, activation, and rollback.
+.TP
+.B --ask-elevate-password
+Ask for the privilege-elevation password during activation.
+.TP
+.B --notify
+Send a desktop notification when lifecycle commands finish. If
+.B notify-send
+is unavailable, prints a warning and preserves the main command result.
+.TP
 .BI "--specialisation " NAME
 Build or activate a NixOS specialisation.
 .TP
@@ -133,6 +166,49 @@ Pass backend stdout and stderr through.
 .TP
 .B json
 Print the final structured report as JSON.
+.SH CONFIGURATION
+Custom checks and hooks are argv arrays, not shell strings.
+.PP
+.EX
+[hooks]
+post_switch = [["systemctl", "--user", "restart", "waybar.service"]]
+
+[ui]
+accent = "#cba6f7"
+.EE
+.PP
+.B post_switch
+hooks run only after a successful
+.B switch
+activation. A failing hook stops later hooks and preserves its exit code.
+.PP
+.B accent
+sets the rich/nom UI accent color. It must be a six-digit hex color.
+.SH JSON OUTPUT
+.B --ui json
+prints one final report object containing command, target, result, store_path,
+current_generation, new_generation, reboot, rollback, log_path, build, diff,
+and activation fields.
+.SH ERROR MODEL
+Build failures stop before activation and preserve the backend exit code.
+Dry-activation failures are fatal for
+.B switch
+and
+.BR test ,
+but are reported as unavailable for
+.BR preview .
+Activation and hook failures preserve the failing command exit code.
+.SH LOGS
+Default logs are written under
+.B $XDG_STATE_HOME/nr/logs/
+or
+.BR ~/.local/state/nr/logs/ .
+.B nr
+keeps the latest 20 default
+.B nr-*.log
+files. Explicit
+.B --log-file
+paths are never rotated.
 .SH TARGET DISCOVERY
 For commands that need a NixOS flake,
 .B nr
@@ -171,6 +247,11 @@ Repository configuration at the selected flake root.
 Default log directory when
 .B XDG_STATE_HOME
 is unset.
+.TP
+.B ~/.local/state/nr/pins.toml
+Default generation pin file when
+.B XDG_STATE_HOME
+is unset.
 .SH EXAMPLES
 .TP
 .B nr preview --flake /etc/nixos#desktop
@@ -183,6 +264,16 @@ Build, explain impact, ask for confirmation, then activate.
 .TP
 .B nr update nixpkgs --switch
 Update one input, then build and activate after Git preflight.
+.TP
+.B nr diff --from 219 --to /nix/store/system-path
+Diff generation 219 against a prebuilt system store path.
+.TP
+.B nr gc --dry-run
+Preview collection of generations older than seven days.
+.TP
+.B nr pin 219 last-good
+Label generation 219 as
+.BR last-good .
 .TP
 .B nr build --ui raw --show-trace
 Build with backend output passed through directly.

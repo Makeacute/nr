@@ -70,6 +70,27 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        value_name = "METHOD",
+        value_parser = ["none", "sudo", "run0"],
+        help = "Forward nixos-rebuild privilege elevation method"
+    )]
+    pub elevate: Option<String>,
+    #[arg(
+        long,
+        visible_alias = "ask-sudo-password",
+        global = true,
+        help = "Ask for the privilege-elevation password during activation"
+    )]
+    pub ask_elevate_password: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Send a desktop notification when lifecycle commands finish"
+    )]
+    pub notify: bool,
+    #[arg(
+        long,
+        global = true,
         value_name = "NAME",
         help = "Build or activate a NixOS specialisation"
     )]
@@ -93,9 +114,15 @@ pub enum NrCommand {
     #[command(about = "Update flake.lock or selected flake inputs")]
     Update(UpdateArgs),
     #[command(about = "Roll back to the previous generation")]
-    Rollback(Passthrough),
+    Rollback(RollbackArgs),
     #[command(about = "Show NixOS generations")]
     Generations(GenerationsArgs),
+    #[command(about = "Diff the current system against a path, generation, or flake")]
+    Diff(DiffArgs),
+    #[command(about = "Run Nix garbage collection with safer defaults")]
+    Gc(GcArgs),
+    #[command(about = "Pin a NixOS generation with a label")]
+    Pin(PinArgs),
     #[command(about = "Review, commit, and optionally push")]
     Publish(PublishArgs),
     #[command(about = "Run configured checks")]
@@ -121,6 +148,14 @@ pub struct UpdateArgs {
 }
 
 #[derive(Clone, Debug, Default, Args)]
+pub struct RollbackArgs {
+    #[arg(value_name = "LABEL_OR_GENERATION")]
+    pub target: Option<String>,
+    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    pub backend_args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Args)]
 pub struct GenerationsArgs {
     #[arg(long, value_name = "PROFILE")]
     pub profile: Option<String>,
@@ -133,6 +168,36 @@ pub enum PublishMode {
     #[value(alias = "single")]
     Commit,
     PerFile,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct DiffArgs {
+    #[arg(long, value_name = "GEN_OR_PATH")]
+    pub from: Option<String>,
+    #[arg(long, value_name = "PATH_OR_FLAKE")]
+    pub to: Option<String>,
+    #[arg(last = true, value_name = "BACKEND_ARG", allow_hyphen_values = true)]
+    pub backend_args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct GcArgs {
+    #[arg(long, value_name = "AGE", default_value = "7d")]
+    pub older_than: String,
+    #[arg(long)]
+    pub delete_old: bool,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct PinArgs {
+    #[arg(value_name = "GENERATION")]
+    pub generation: u64,
+    #[arg(value_name = "LABEL")]
+    pub label: String,
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -170,6 +235,8 @@ impl Cli {
             offline: self.offline,
             show_trace: self.show_trace,
             specialisation: self.specialisation.clone(),
+            elevate: self.elevate.clone(),
+            ask_elevate_password: self.ask_elevate_password,
             backend_args: backend_args.to_vec(),
         }
     }
@@ -233,8 +300,11 @@ pub fn run() -> Result<i32> {
             let config = load_config(cli.config_input())?;
             crate::lifecycle::run_update(&cli, &config, args)
         }
-        NrCommand::Rollback(args) => crate::lifecycle::run_rollback(&cli, &args.backend_args),
-        NrCommand::Generations(args) => crate::lifecycle::run_generations(args),
+        NrCommand::Rollback(args) => crate::lifecycle::run_rollback(&cli, args),
+        NrCommand::Generations(args) => crate::generations::run_generations(args),
+        NrCommand::Diff(args) => crate::lifecycle::run_diff(&cli, args),
+        NrCommand::Gc(args) => crate::lifecycle::run_gc(args),
+        NrCommand::Pin(args) => crate::generations::run_pin(args),
         NrCommand::Publish(args) => {
             let config = load_config(cli.config_input())?;
             crate::publish::run_publish(&config, args)
