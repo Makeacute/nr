@@ -64,6 +64,7 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
         log_path: log.path().to_path_buf(),
     };
     renderer.start(&header);
+    maybe_validate_sudo_early(action, preview, &options, &mut log, &mut renderer)?;
 
     if !config.hooks.pre_build.is_empty() {
         renderer.phase("pre-build hooks");
@@ -603,6 +604,7 @@ fn run_lifecycle_from_plan(
         log_path: log.path().to_path_buf(),
     };
     renderer.start(&header);
+    maybe_validate_sudo_early(action, false, &options, &mut log, &mut renderer)?;
     renderer.phase("using saved preview plan");
     log.write_line(
         crate::process::StreamSource::Stdout,
@@ -1506,6 +1508,43 @@ fn should_announce_backend(renderer: &Renderer) -> bool {
     renderer.mode() == OutputMode::Raw
 }
 
+fn maybe_validate_sudo_early(
+    action: &str,
+    preview: bool,
+    options: &backend::BackendOptions,
+    log: &mut LogFile,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    if !should_validate_sudo_early(action, preview, options) {
+        return Ok(());
+    }
+
+    renderer.phase("privilege check");
+    let command = CommandSpec::new("sudo").arg("-v");
+    log.write_command(&command)?;
+    let code = run_inherit(&command, false)?;
+    if code != 0 {
+        return Err(NrError::CommandFailed {
+            command: command.render(),
+            code,
+        });
+    }
+    Ok(())
+}
+
+fn should_validate_sudo_early(
+    action: &str,
+    preview: bool,
+    options: &backend::BackendOptions,
+) -> bool {
+    !preview
+        && matches!(action, "switch" | "test" | "boot" | "rollback")
+        && options.elevate.as_deref() == Some("sudo")
+        && !options.ask_elevate_password
+        && options.target_host.is_none()
+        && !options.use_remote_sudo
+}
+
 fn ingest_build_line(
     state: &mut BuildState,
     line: &StreamLine,
@@ -1871,7 +1910,8 @@ fn failure_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_default_elevation_with_context, focused_lockfile_diff, should_apply_default_elevation,
+        apply_default_elevation_with_context, focused_lockfile_diff,
+        should_apply_default_elevation, should_validate_sudo_early,
     };
     use crate::backend::BackendOptions;
 
@@ -1916,6 +1956,22 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn local_sudo_elevation_is_validated_before_building() {
+        let mut options = BackendOptions {
+            elevate: Some("sudo".to_string()),
+            ..BackendOptions::default()
+        };
+        assert!(should_validate_sudo_early("switch", false, &options));
+
+        options.target_host = Some("root@remote".to_string());
+        assert!(!should_validate_sudo_early("switch", false, &options));
+
+        options.target_host = None;
+        options.ask_elevate_password = true;
+        assert!(!should_validate_sudo_early("switch", false, &options));
     }
 
     #[test]

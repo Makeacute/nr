@@ -4,9 +4,9 @@
 `nixos-rebuild`, parses Nix internal JSON build events itself, explains closure
 and activation impact, and exits with the real backend status code.
 
-The default interactive lifecycle UI uses `nom` for users who want the
-`nix-output-monitor` build tree. Use `--ui rich` to keep the live rebuild graph
-inside `nr`.
+The default interactive lifecycle UI uses `nr`'s quieter rich rebuild graph. Use
+`--ui nom` to stream through `nix-output-monitor` when you want its full build
+tree.
 Rollback avoids manual profile editing.
 
 ## Commands
@@ -69,7 +69,7 @@ mainly useful for remote or non-TTY elevation flows.
 Output modes:
 
 ```text
---ui auto               nom for interactive lifecycle builds; plain otherwise
+--ui auto               rich for interactive lifecycle builds; plain otherwise
 --ui rich               Styled live rebuild graph
 --ui nom                Pipe build logs through nom --json for an nh-like tree
 --ui plain              Stable script-friendly text; no per-event build spam

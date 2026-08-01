@@ -39,7 +39,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value = "auto",
-        help = "Select command output mode; auto uses nom for interactive lifecycle builds"
+        help = "Select command output mode; auto uses rich for interactive lifecycle builds"
     )]
     pub ui: OutputMode,
     #[arg(

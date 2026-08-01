@@ -50,7 +50,7 @@ impl OutputMode {
 
     pub fn effective_for_lifecycle_with_terminal(self, action: &str, interactive: bool) -> Self {
         match self {
-            Self::Auto if interactive && uses_build_ui_by_default(action) => Self::Nom,
+            Self::Auto if interactive && uses_build_ui_by_default(action) => Self::Rich,
             Self::Auto => self.effective_with_terminal(interactive),
             value => value,
         }
@@ -619,6 +619,7 @@ fn should_print_backend_line(line: &str) -> bool {
     let lower = trimmed.to_lowercase();
     if lower.starts_with("debug:")
         || lower.starts_with("trace:")
+        || (lower.starts_with("warning: git tree ") && lower.ends_with(" is dirty"))
         || lower.contains("nixos_rebuild.process: captured output")
         || lower.contains("nixos-rebuild.process: captured output")
         || lower.contains("captured output with stdout=")
@@ -635,11 +636,7 @@ fn should_print_backend_line(line: &str) -> bool {
 fn print_header_details(header: &RebuildHeader) {
     if header.git.repository {
         let branch = header.git.branch.as_deref().unwrap_or("detached");
-        let dirty = if header.git.dirty { "dirty" } else { "clean" };
-        println!(
-            "⎇ git: {branch} ({dirty}, {} untracked)",
-            header.git.untracked
-        );
+        println!("⎇ git: {branch} ({})", git_status_label(&header.git));
     } else {
         println!("⎇ git: not a repository");
     }
@@ -653,6 +650,17 @@ fn print_header_details(header: &RebuildHeader) {
         println!("● current kernel: {kernel}");
     }
     println!("▣ log: {}", header.log_path.display());
+}
+
+fn git_status_label(summary: &GitSummary) -> String {
+    if !summary.dirty {
+        return "clean".to_string();
+    }
+    if summary.untracked > 0 {
+        format!("dirty, {} untracked", summary.untracked)
+    } else {
+        "dirty".to_string()
+    }
 }
 
 fn print_diff_summary(diff: &ClosureDiff) {
@@ -784,17 +792,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::events::{Activity, ActivityStatus, BuildCategory, BuildState};
+    use crate::git::GitSummary;
 
     use super::{
-        OutputMode, Renderer, build_graph_lines, should_print_backend_line, truncate_line,
+        OutputMode, Renderer, build_graph_lines, git_status_label, should_print_backend_line,
+        truncate_line,
     };
 
     #[test]
-    fn auto_uses_nom_for_interactive_lifecycle_builds() {
+    fn auto_uses_rich_for_interactive_lifecycle_builds() {
         for action in ["build", "switch", "test", "boot", "preview"] {
             assert_eq!(
                 OutputMode::Auto.effective_for_lifecycle_with_terminal(action, true),
-                OutputMode::Nom
+                OutputMode::Rich
             );
         }
     }
@@ -827,6 +837,20 @@ mod tests {
             renderer.accent_line("▶ evaluating/building"),
             "▶ evaluating/building"
         );
+    }
+
+    #[test]
+    fn git_status_label_omits_zero_untracked_count() {
+        let mut summary = GitSummary {
+            repository: true,
+            branch: Some("main".to_string()),
+            dirty: true,
+            untracked: 0,
+        };
+        assert_eq!(git_status_label(&summary), "dirty");
+
+        summary.untracked = 2;
+        assert_eq!(git_status_label(&summary), "dirty, 2 untracked");
     }
 
     #[test]
@@ -958,6 +982,9 @@ digraph G {
         ));
         assert!(!should_print_backend_line(
             "nixos_rebuild.process: captured output with stdout='', stderr=\"error: noisy\""
+        ));
+        assert!(!should_print_backend_line(
+            "warning: Git tree '/etc/nixos' is dirty"
         ));
         assert!(should_print_backend_line("error: real failure"));
         assert!(should_print_backend_line("warning: real warning"));

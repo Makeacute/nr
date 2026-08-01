@@ -54,7 +54,7 @@ TARGET SELECTION
 
 COMMON FLAGS
   --ui auto|rich|nom|plain|raw|json|jsonl
-                           Select command output mode. auto uses nom for interactive lifecycle builds.
+                           Select command output mode. auto uses rich for interactive lifecycle builds.
   --log-file PATH          Capture the full backend log at PATH.
   --dry                    Alias lifecycle commands to preview-style behavior.
   --ask                    Ask before activation.

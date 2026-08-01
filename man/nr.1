@@ -1,4 +1,4 @@
-.TH NR 1 "August 2026" "nr 0.3.4" "User Commands"
+.TH NR 1 "August 2026" "nr 0.3.5" "User Commands"
 .SH NAME
 nr \- Git-aware NixOS lifecycle helper
 .SH SYNOPSIS
@@ -132,7 +132,7 @@ Override the NixOS configuration name.
 Select output mode. The default,
 .BR auto ,
 uses
-.B nom
+.B rich
 for interactive lifecycle builds and plain output otherwise.
 .TP
 .BI "--log-file " PATH
@@ -209,7 +209,7 @@ Pass remaining arguments directly to the backend command.
 .TP
 .B auto
 Use
-.B nom
+.B rich
 for interactive lifecycle builds and plain output otherwise.
 .TP
 .B rich
