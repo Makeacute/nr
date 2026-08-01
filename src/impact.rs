@@ -148,11 +148,7 @@ fn remote_current_generation(host: &str) -> Option<u64> {
 }
 
 fn remote_kernel_version(host: &str) -> Option<String> {
-    remote_readlink(host, "/run/current-system/kernel").and_then(|path| {
-        Path::new(&path)
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-    })
+    remote_command_trimmed(host, "uname -r")
 }
 
 fn remote_readlink(host: &str, path: &str) -> Option<String> {
@@ -169,11 +165,11 @@ fn remote_readlink(host: &str, path: &str) -> Option<String> {
 }
 
 fn remote_read_trimmed(host: &str, path: &str) -> Option<String> {
-    let output = run_capture(
-        &backend::ssh_command(host, &format!("cat {}", shell_quote(path))),
-        false,
-    )
-    .ok()?;
+    remote_command_trimmed(host, &format!("cat {}", shell_quote(path)))
+}
+
+fn remote_command_trimmed(host: &str, command: &str) -> Option<String> {
+    let output = run_capture(&backend::ssh_command(host, command), false).ok()?;
     if output.code == 0 {
         Some(output.stdout.trim().to_string()).filter(|value| !value.is_empty())
     } else {
@@ -315,12 +311,12 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 }
 
 fn kernel_version() -> Option<String> {
-    fs::read_link("/run/current-system/kernel")
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_string())
-        })
+    let output = run_capture(&backend::uname_kernel_release_command(), false).ok()?;
+    if output.code == 0 {
+        Some(output.stdout.trim().to_string()).filter(|value| !value.is_empty())
+    } else {
+        None
+    }
 }
 
 fn remember_important(diff: &mut ClosureDiff, item: &str) {

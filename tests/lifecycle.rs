@@ -1059,7 +1059,10 @@ fn remote_diff_defaults_from_remote_current_system() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("current kernel: 6.18.40-remote"));
     let log = support::command_log(&command_log);
+    assert!(log.contains("ssh root@remote uname -r"));
     assert!(log.contains("ssh root@remote readlink -f '/run/current-system'"));
     assert!(log.contains(
         "nix store diff-closures /nix/store/remote-current-system /nix/store/fake-system"

@@ -301,8 +301,8 @@ esac
 	  *"readlink -f '/nix/var/nix/profiles/system'"*)
 	    echo "/nix/var/nix/profiles/system-7-link"
 	    ;;
-	  *"readlink -f '/run/current-system/kernel'"*)
-	    echo "/nix/store/linux-remote-kernel"
+	  *"uname -r"*)
+	    echo "6.18.40-remote"
 	    ;;
 	  *"cat '/run/current-system/nixos-version'"*)
 	    echo "26.11-remote"

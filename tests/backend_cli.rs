@@ -3,7 +3,7 @@ use nr::backend::{
     BackendOptions, generations_json_command, nix_collect_garbage_command,
     nix_store_diff_closures_command, nixos_rebuild_activate_command, nixos_rebuild_build_command,
     nixos_rebuild_dry_activate_command, nom_json_command, notify_send_command, rollback_command,
-    rollback_to_store_path_command,
+    rollback_to_store_path_command, uname_kernel_release_command,
 };
 use nr::cli::{Cli, NrCommand, PublishMode};
 use nr::config::FlakeTarget;
@@ -145,6 +145,14 @@ fn nom_command_consumes_internal_json_logs() {
     assert_eq!(
         nom_json_command().to_vec(),
         ["nom", "--json"].map(String::from)
+    );
+}
+
+#[test]
+fn uname_command_reads_running_kernel_release() {
+    assert_eq!(
+        uname_kernel_release_command().to_vec(),
+        ["uname", "-r"].map(String::from)
     );
 }
 

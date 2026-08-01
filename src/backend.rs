@@ -232,6 +232,10 @@ pub fn ssh_command(host: &str, command: &str) -> CommandSpec {
         .arg(command.to_string())
 }
 
+pub fn uname_kernel_release_command() -> CommandSpec {
+    CommandSpec::new("uname").arg("-r")
+}
+
 pub fn nix_collect_garbage_command(
     older_than: &str,
     delete_old: bool,
