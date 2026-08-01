@@ -54,6 +54,7 @@ pub fn fake_bin() -> (TestDir, PathBuf, PathBuf) {
     fs::create_dir_all(&bin).unwrap();
     let log = temp.path().join("commands.log");
     let shell = shell_path();
+    let git = tool_path("git").unwrap_or_else(|| PathBuf::from("git"));
 
     write_executable(
         &bin.join("nixos-rebuild"),
@@ -178,7 +179,9 @@ case "$*" in
 	      fi
 	      previous="$arg"
 	    done
-	    if [ "${NR_FAKE_UPDATE_WRITE_LOCK:-0}" = 1 ]; then
+	    if [ -n "${NR_FAKE_UPDATE_LOCK_JSON:-}" ]; then
+	      printf '%s\n' "$NR_FAKE_UPDATE_LOCK_JSON" > "$flake/flake.lock"
+	    elif [ "${NR_FAKE_UPDATE_WRITE_LOCK:-0}" = 1 ]; then
 	      printf 'updated\n' > "$flake/flake.lock"
 	    fi
 	    echo "updated"
@@ -321,16 +324,20 @@ esac
         &bin.join("git"),
         &script_with_shell(
             &shell,
-            r#"set -u
+            &format!(
+                r#"set -u
+real_git='{}'
 case "$*" in
   *"rev-parse --is-inside-work-tree"*)
     exit 128
     ;;
   *)
-    /run/current-system/sw/bin/git "$@"
+    "$real_git" "$@"
     ;;
 esac
 "#,
+                git.display()
+            ),
         ),
     )
     .unwrap();
@@ -360,6 +367,13 @@ fn shell_path() -> PathBuf {
         }
     }
     PathBuf::from("/bin/sh")
+}
+
+fn tool_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 pub fn command_log(path: &Path) -> String {

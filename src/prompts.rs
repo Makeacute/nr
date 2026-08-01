@@ -27,19 +27,16 @@ pub fn confirm(prompt: &str, default: bool) -> bool {
 }
 
 pub fn choose(prompt: &str, choices: &[(&str, &str)], default: Option<&str>) -> Option<String> {
-    for (key, label) in choices {
+    for (index, (key, label)) in choices.iter().enumerate() {
         let marker = if Some(*key) == default {
             " (default)"
         } else {
             ""
         };
-        println!("  {key}: {label}{marker}");
+        println!("{}. {key}: {label}{marker}", index + 1);
     }
     loop {
-        let suffix = default
-            .map(|value| format!(" [{value}] "))
-            .unwrap_or_else(|| " ".to_string());
-        print!("{prompt}{suffix}");
+        print!("{prompt}: ");
         let _ = io::stdout().flush();
         let mut answer = String::new();
         match io::stdin().read_line(&mut answer) {
@@ -52,11 +49,17 @@ pub fn choose(prompt: &str, choices: &[(&str, &str)], default: Option<&str>) -> 
                 if choices.iter().any(|(key, _)| *key == answer) {
                     return Some(answer.to_string());
                 }
+                if let Ok(choice_number) = answer.parse::<usize>()
+                    && (1..=choices.len()).contains(&choice_number)
+                {
+                    return Some(choices[choice_number - 1].0.to_string());
+                }
                 println!(
                     "Please choose one of: {}.",
                     choices
                         .iter()
-                        .map(|(key, _)| *key)
+                        .enumerate()
+                        .map(|(index, (key, _))| format!("{} or {}", index + 1, key))
                         .collect::<Vec<_>>()
                         .join(", ")
                 );

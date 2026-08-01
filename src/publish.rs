@@ -8,6 +8,8 @@ use crate::git::{
 use crate::process::{CommandSpec, run_capture, run_inherit};
 use crate::prompts::{choose, confirm, read_line};
 
+const DEFAULT_COMMIT_MESSAGE: &str = "commit";
+
 pub fn run_publish(config: &NrConfig, args: &PublishArgs) -> Result<i32> {
     let flake_path = &config.target.path;
     ensure_git_repository(flake_path)?;
@@ -191,7 +193,7 @@ fn commit_message(message: Option<&str>) -> Result<String> {
         }
         return Ok(message.to_string());
     }
-    let value = read_line("Commit message:", None)
+    let value = read_line("Commit message:", Some(DEFAULT_COMMIT_MESSAGE))
         .ok_or_else(|| NrError::message("Commit message is required."))?;
     let value = value.trim();
     if value.is_empty() {

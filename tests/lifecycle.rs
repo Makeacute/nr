@@ -1026,6 +1026,54 @@ fn update_switch_reverts_lockfile_to_pre_update_state_on_failure() {
 }
 
 #[test]
+fn update_input_prints_focused_lock_change() {
+    let flake = support::TestDir::new();
+    support::initialize_repository(flake.path());
+    std::fs::write(
+        flake.path().join("flake.lock"),
+        lockfile_json("old-nr", "old-home-manager"),
+    )
+    .unwrap();
+    support::git(flake.path(), &["add", "flake.lock"]);
+    support::git(flake.path(), &["commit", "--quiet", "-m", "lock"]);
+    let (_fake, bin, command_log) = support::fake_bin();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = nr_command()
+        .env("PATH", path)
+        .env("NR_FAKE_LOG", &command_log)
+        .env(
+            "NR_FAKE_UPDATE_LOCK_JSON",
+            lockfile_json("new-nr", "new-home-manager"),
+        )
+        .args([
+            "--flake",
+            &format!("{}#host", flake.path().display()),
+            "update",
+            "nr",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("requested input changes"));
+    assert!(stdout.contains("nr:"));
+    assert!(stdout.contains("old-nr -> new-nr"));
+    assert!(!stdout.contains("new-home-manager"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("1 other lock node"));
+}
+
+#[test]
 fn remote_diff_defaults_from_remote_current_system() {
     let flake = support::TestDir::new();
     support::make_flake(flake.path());
@@ -1205,4 +1253,40 @@ fn unique_test_path(kind: &str) -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     std::env::temp_dir().join(format!("nr-test-{kind}-{}-{nanos}", std::process::id()))
+}
+
+fn lockfile_json(nr_rev: &str, home_manager_rev: &str) -> String {
+    format!(
+        r#"{{
+  "root": "root",
+  "nodes": {{
+    "root": {{
+      "inputs": {{
+        "nr": "nr",
+        "home-manager": "home-manager"
+      }}
+    }},
+    "nr": {{
+      "locked": {{
+        "type": "github",
+        "owner": "Makeacute",
+        "repo": "nr",
+        "rev": "{nr_rev}",
+        "narHash": "sha256-{nr_rev}",
+        "lastModified": 1
+      }}
+    }},
+    "home-manager": {{
+      "locked": {{
+        "type": "github",
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "{home_manager_rev}",
+        "narHash": "sha256-{home_manager_rev}",
+        "lastModified": 1
+      }}
+    }}
+  }}
+}}"#
+    )
 }

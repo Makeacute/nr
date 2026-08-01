@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::backend;
 use crate::cli::{
@@ -279,7 +280,7 @@ pub fn run_lifecycle(action: &str, cli: &Cli, backend_args: &[String]) -> Result
 
 pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32> {
     ensure_git_flake_visible(&config.target.path)?;
-    let lockfile_snapshot = if args.revert_on_failure {
+    let lockfile_snapshot = if args.revert_on_failure || !args.inputs.is_empty() {
         Some(LockfileSnapshot::capture(&config.target.path)?)
     } else {
         None
@@ -288,18 +289,22 @@ pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32
     let command = backend::nix_flake_update_command(&config.target, &args.inputs, &options);
     let code = run_inherit(&command, true)?;
     if code != 0 {
-        restore_lockfile_after_failure(lockfile_snapshot.as_ref());
+        restore_lockfile_after_failure(args.revert_on_failure, lockfile_snapshot.as_ref());
         return Err(NrError::CommandFailed {
             command: command.render(),
             code,
         });
     }
-    show_lockfile_diff(&config.target.path)?;
+    show_lockfile_diff(
+        &config.target.path,
+        &args.inputs,
+        lockfile_snapshot.as_ref(),
+    )?;
     if args.switch {
         match run_lifecycle("switch", cli, &[]) {
             Ok(code) => Ok(code),
             Err(error) => {
-                restore_lockfile_after_failure(lockfile_snapshot.as_ref());
+                restore_lockfile_after_failure(args.revert_on_failure, lockfile_snapshot.as_ref());
                 Err(error)
             }
         }
@@ -308,7 +313,11 @@ pub fn run_update(cli: &Cli, config: &NrConfig, args: &UpdateArgs) -> Result<i32
     }
 }
 
-fn show_lockfile_diff(flake_path: &Path) -> Result<()> {
+fn show_lockfile_diff(
+    flake_path: &Path,
+    requested_inputs: &[String],
+    lockfile_before: Option<&LockfileSnapshot>,
+) -> Result<()> {
     if !flake_path.join(".git").exists() {
         return Ok(());
     }
@@ -317,6 +326,12 @@ fn show_lockfile_diff(flake_path: &Path) -> Result<()> {
         false,
     )?;
     if status.stdout.trim().is_empty() {
+        return Ok(());
+    }
+    if !requested_inputs.is_empty()
+        && let Some(before) = lockfile_before
+        && show_focused_lockfile_diff(flake_path, requested_inputs, before)?
+    {
         return Ok(());
     }
     println!("flake.lock changed:");
@@ -328,6 +343,176 @@ fn show_lockfile_diff(flake_path: &Path) -> Result<()> {
         eprintln!("warning: git diff exited with {code}");
     }
     Ok(())
+}
+
+fn show_focused_lockfile_diff(
+    flake_path: &Path,
+    requested_inputs: &[String],
+    before: &LockfileSnapshot,
+) -> Result<bool> {
+    let Some(before_contents) = &before.contents else {
+        return Ok(false);
+    };
+    let lock_path = flake_path.join("flake.lock");
+    let after_contents = fs::read(&lock_path).map_err(|source| NrError::Io {
+        context: format!("failed to read {}", lock_path.display()),
+        source,
+    })?;
+    let Some(diff) = focused_lockfile_diff(before_contents, &after_contents, requested_inputs)
+    else {
+        return Ok(false);
+    };
+
+    println!("flake.lock changed:");
+    if diff.requested.is_empty() {
+        println!(
+            "  requested inputs unchanged: {}",
+            requested_inputs.join(", ")
+        );
+    } else {
+        println!("  requested input changes:");
+        for change in &diff.requested {
+            println!("    {}:", change.input);
+            if change.fields.is_empty() {
+                println!("      locked: changed");
+            } else {
+                for field in &change.fields {
+                    println!("      {}: {} -> {}", field.name, field.before, field.after);
+                }
+            }
+        }
+    }
+    if diff.other_changed > 0 {
+        eprintln!(
+            "warning: {} other lock node(s) changed; run `git -C {} diff -- flake.lock` to inspect them",
+            diff.other_changed,
+            flake_path.display()
+        );
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FocusedLockDiff {
+    requested: Vec<FocusedInputChange>,
+    other_changed: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FocusedInputChange {
+    input: String,
+    fields: Vec<FocusedFieldChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FocusedFieldChange {
+    name: String,
+    before: String,
+    after: String,
+}
+
+fn focused_lockfile_diff(
+    before_contents: &[u8],
+    after_contents: &[u8],
+    requested_inputs: &[String],
+) -> Option<FocusedLockDiff> {
+    let before: Value = serde_json::from_slice(before_contents).ok()?;
+    let after: Value = serde_json::from_slice(after_contents).ok()?;
+    let before_nodes = before.get("nodes")?.as_object()?;
+    let after_nodes = after.get("nodes")?.as_object()?;
+    let requested = requested_inputs
+        .iter()
+        .map(|input| {
+            (
+                input.as_str(),
+                lock_node_for_input(&after, input).unwrap_or(input.as_str()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let requested_nodes = requested
+        .iter()
+        .map(|(_, node)| *node)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut requested_changes = Vec::new();
+    for (input, node) in requested {
+        let before_locked = before_nodes.get(node).and_then(|node| node.get("locked"));
+        let after_locked = after_nodes.get(node).and_then(|node| node.get("locked"));
+        if before_locked == after_locked {
+            continue;
+        }
+        requested_changes.push(FocusedInputChange {
+            input: input.to_string(),
+            fields: focused_field_changes(before_locked, after_locked),
+        });
+    }
+
+    let mut changed_nodes = std::collections::BTreeSet::new();
+    for node in before_nodes.keys().chain(after_nodes.keys()) {
+        let before_locked = before_nodes.get(node).and_then(|node| node.get("locked"));
+        let after_locked = after_nodes.get(node).and_then(|node| node.get("locked"));
+        if before_locked != after_locked {
+            changed_nodes.insert(node.as_str());
+        }
+    }
+    let other_changed = changed_nodes
+        .into_iter()
+        .filter(|node| !requested_nodes.contains(node))
+        .count();
+
+    Some(FocusedLockDiff {
+        requested: requested_changes,
+        other_changed,
+    })
+}
+
+fn lock_node_for_input<'a>(lock: &'a Value, input: &str) -> Option<&'a str> {
+    let first = input.split('/').next().filter(|value| !value.is_empty())?;
+    let root = lock.get("root").and_then(Value::as_str).unwrap_or("root");
+    let reference = lock.get("nodes")?.get(root)?.get("inputs")?.get(first)?;
+    if let Some(node) = reference.as_str() {
+        Some(node)
+    } else {
+        reference
+            .as_array()
+            .and_then(|values| values.last())
+            .and_then(Value::as_str)
+    }
+}
+
+fn focused_field_changes(
+    before_locked: Option<&Value>,
+    after_locked: Option<&Value>,
+) -> Vec<FocusedFieldChange> {
+    let mut fields = Vec::new();
+    for name in [
+        "rev",
+        "narHash",
+        "lastModified",
+        "ref",
+        "owner",
+        "repo",
+        "type",
+    ] {
+        let before = before_locked.and_then(|value| value.get(name));
+        let after = after_locked.and_then(|value| value.get(name));
+        if before != after {
+            fields.push(FocusedFieldChange {
+                name: name.to_string(),
+                before: lock_value_text(before),
+                after: lock_value_text(after),
+            });
+        }
+    }
+    fields
+}
+
+fn lock_value_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => "<missing>".to_string(),
+    }
 }
 
 #[derive(Clone)]
@@ -370,7 +555,10 @@ impl LockfileSnapshot {
     }
 }
 
-fn restore_lockfile_after_failure(snapshot: Option<&LockfileSnapshot>) {
+fn restore_lockfile_after_failure(enabled: bool, snapshot: Option<&LockfileSnapshot>) {
+    if !enabled {
+        return;
+    }
     let Some(snapshot) = snapshot else {
         return;
     };
@@ -1682,7 +1870,9 @@ fn failure_report(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_default_elevation_with_context, should_apply_default_elevation};
+    use super::{
+        apply_default_elevation_with_context, focused_lockfile_diff, should_apply_default_elevation,
+    };
     use crate::backend::BackendOptions;
 
     #[test]
@@ -1726,5 +1916,38 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn focused_lockfile_diff_reports_requested_input_only() {
+        let before = test_lockfile("old-nr", "old-home-manager");
+        let after = test_lockfile("new-nr", "new-home-manager");
+        let diff = focused_lockfile_diff(before.as_bytes(), after.as_bytes(), &["nr".to_string()])
+            .expect("focused lock diff");
+
+        assert_eq!(diff.requested.len(), 1);
+        assert_eq!(diff.requested[0].input, "nr");
+        assert!(
+            diff.requested[0]
+                .fields
+                .iter()
+                .any(|field| field.name == "rev"
+                    && field.before == "old-nr"
+                    && field.after == "new-nr")
+        );
+        assert_eq!(diff.other_changed, 1);
+    }
+
+    fn test_lockfile(nr_rev: &str, home_manager_rev: &str) -> String {
+        format!(
+            r#"{{
+  "root": "root",
+  "nodes": {{
+    "root": {{"inputs": {{"nr": "nr", "home-manager": "home-manager"}}}},
+    "nr": {{"locked": {{"type": "github", "rev": "{nr_rev}", "narHash": "sha256-{nr_rev}"}}}},
+    "home-manager": {{"locked": {{"type": "github", "rev": "{home_manager_rev}", "narHash": "sha256-{home_manager_rev}"}}}}
+  }}
+}}"#
+        )
     }
 }
